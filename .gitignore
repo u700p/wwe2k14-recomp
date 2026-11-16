@@ -1,10 +1,58 @@
+# ---- Hard rule: nothing from the game is ever committed ----
+game_data/
+# The Linux codegen route (docs/BUILDING.md, wwe2k14_config.toml) reads game/default.xex + game/default.xexp:
+# keep that folder out too, whichever route a build uses.
 game/
-generated/
-out/
-logs/
-*.xex
 *.xexp
+# Everything ReXGlue generates stays out (recompiled game code lives in generated/default/)...
+generated/*
+# ...except this one file: pure ReXGlue CMake boilerplate written by `rexglue init`, no game data.
+# Verified 2026-10-06: differs from the iruka demo's copy only by project name. The build needs it.
+!generated/rexglue.cmake
+out/
+*.xex
+*.pac
+*.bik
+*.bik2
 *.iso
-*.log
+*.xdbf
+*.stfs
+# Session 32: DLC packs (the player's own game content) wherever they are copied in the repo: a dlc folder at the top
+# (tools/dlc/ is our code and stays tracked), the packs' sound banks and catalogs.
+/dlc*/
+*.pck
+catalog.dlc
+catalog_hd.arc
+catalog_sd.arc
+
+# ---- Build / tooling output ----
+build/
 CMakeUserPresets.json
 compile_commands.json
+logs/
+*.log
+!tools/board/fixtures/**/*.log
+.vs/
+.vscode/
+__pycache__/
+*.pyc
+
+# ---- Third-party checkouts (cloned locally, not vendored) ----
+thirdparty/
+
+
+# Session 29: personal Claude Code settings (the PLAYBOOK upload hook names a personal address)
+.claude/settings.local.json
+
+# Session 75: songs Jarrod drops in for the new music slots (never committed)
+*.mp3
+*.m4a
+*.flac
+*.wma
+*.aac
+
+# S101 case zips (game data: never committed; CLAUDE.md hard rule 1)
+/cases/
+*.zip.part
+case_*.zip
+*.pdb

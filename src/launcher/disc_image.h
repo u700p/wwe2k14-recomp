@@ -1,0 +1,385 @@
+#pragma once
+// Session 26: the game files as the launcher sees them, from a folder or an Xbox 360 disc image (.iso). The game
+// itself mounts either (ReXGlue's DiscImageDevice); the launcher only needs a few reads: default.xex for the version
+// check, Bink headers of the original trons, the titantron folder's file names.
+//
+// Disc image layout (as DiscImageDevice reads it, from Xenia; tools\iso\make_xiso.py writes the same): 2048-byte
+// sectors; at sector 32 of the game partition "MICROSOFT*XBOX*MEDIA", the root table's sector and size; a table is a
+// binary tree of entries (left / right links in 4-byte units, sector, size, attributes, name length, name), all
+// little-endian. The game partition starts at one of a few known offsets (0 for a trimmed image).
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+namespace launcher {
+
+namespace fs = std::filesystem;
+
+class DiscImage {
+ public:
+  struct Entry {
+    std::string name;
+    bool dir = false;
+    uint64_t offset = 0, size = 0;  // file data in the image
+    std::vector<std::unique_ptr<Entry>> children;
+  };
+
+  // False with `error` set (plain English) if this isn't a readable disc image.
+  bool Open(const fs::path& path, std::string& error) {
+#ifdef _WIN32
+    f_.open(path, std::ios::binary);
+    std::error_code ec;
+    size_ = fs::file_size(path, ec);
+    if (!f_ || ec) return error = "can't open the file", false;
+#else
+    // Session 71 (Android): a file picked with Android's file picker arrives as /proc/self/fd/N; opening that path
+    // again is refused for files outside the app's folder (b46: "can't open the file"), so read through a duplicate
+    // of the descriptor the process already holds.
+    const std::string p = path.string();
+    if (p.rfind("/proc/self/fd/", 0) == 0) fd_ = fcntl(std::atoi(p.c_str() + 14), F_DUPFD_CLOEXEC, 0);
+    else fd_ = open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    struct stat st {};
+    if (fd_ < 0 || fstat(fd_, &st) != 0) return error = "can't open the file", false;
+    size_ = uint64_t(st.st_size);
+#endif
+    static constexpr uint64_t kOffsets[] = {0x00000000, 0x0000FB20, 0x00020600, 0x02080000, 0x0FD90000};
+    uint8_t head[28];
+    bool found = false;
+    for (uint64_t off : kOffsets) {
+      if (Read(off + 32 * kSector, head, sizeof(head)) && std::memcmp(head, "MICROSOFT*XBOX*MEDIA", 20) == 0) {
+        base_ = off, found = true;
+        break;
+      }
+    }
+    if (!found) return error = "not an Xbox 360 disc image", false;
+    const uint32_t root_sector = Le32(head + 20), root_size = Le32(head + 24);
+    root_.dir = true;
+    if (!ReadTable(root_sector, root_size, root_, 0)) return error = "the disc image is damaged", false;
+    if (past_end_) {
+      error = "the disc image is incomplete (" + std::to_string(past_end_) + " of " + std::to_string(files_) +
+              " files are missing from its end): copy it again";
+      return false;
+    }
+    return true;
+  }
+
+  // Path inside the image, '/' or '\' separated, any case; nullptr if missing.
+  const Entry* Find(const std::string& path) const {
+    const Entry* e = &root_;
+    size_t i = 0;
+    while (i < path.size()) {
+      size_t j = path.find_first_of("/\\", i);
+      if (j == std::string::npos) j = path.size();
+      if (j > i) {
+        const std::string part = path.substr(i, j - i);
+        const Entry* next = nullptr;
+        for (const auto& c : e->children)
+          if (EqualNoCase(c->name, part)) next = c.get();
+        if (!next) return nullptr;
+        e = next;
+      }
+      i = j + 1;
+    }
+    return e;
+  }
+
+  bool ReadFile(const Entry& e, uint64_t offset, void* out, size_t n) {
+    if (e.dir || offset + n > e.size) return false;
+    return Read(e.offset + offset, out, n);
+  }
+
+  uint64_t game_offset() const { return base_; }
+
+ private:
+  static constexpr uint64_t kSector = 2048;
+
+  static uint32_t Le32(const uint8_t* p) { return p[0] | p[1] << 8 | p[2] << 16 | uint32_t(p[3]) << 24; }
+  static uint16_t Le16(const uint8_t* p) { return uint16_t(p[0] | p[1] << 8); }
+  static bool EqualNoCase(const std::string& a, const std::string& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+             return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
+           });
+  }
+
+  bool Read(uint64_t pos, void* out, size_t n) {
+    if (pos + n > size_) return false;
+#ifdef _WIN32
+    f_.clear();
+    f_.seekg(std::streamoff(pos));
+    return bool(f_.read(static_cast<char*>(out), std::streamsize(n)));
+#else
+    auto* dst = static_cast<uint8_t*>(out);
+    while (n) {
+      const ssize_t got = pread(fd_, dst, n, off_t(pos));
+      if (got <= 0) return false;
+      dst += got, pos += uint64_t(got), n -= size_t(got);
+    }
+    return true;
+#endif
+  }
+
+  // A damaged image is refused, never looped over: every table is read once, every entry visited once, the depth
+  // (tree links + folder nesting together) stays under 1024 and all tables together under 64 MiB. Real trees are
+  // balanced and shallow (the same rules as ReXGlue's DiscImageDevice, Session 26 review).
+  bool ReadTable(uint32_t sector, uint32_t size, Entry& parent, int depth) {
+    if (!size) return true;
+    const uint64_t pos = base_ + uint64_t(sector) * kSector;
+    table_bytes_ += size;
+    if (size > (32u << 20) || table_bytes_ > (64u << 20) || depth > kMaxDepth) return false;
+    if (std::find(tables_.begin(), tables_.end(), pos) != tables_.end()) return false;  // a table used twice
+    tables_.push_back(pos);
+    std::vector<uint8_t> t(size);
+    if (!Read(pos, t.data(), t.size())) return false;
+    if (size >= 4 && Le32(t.data()) == 0xFFFFFFFFu) return true;  // an empty folder stored as padding
+    std::vector<uint8_t> visited(size / 4 + 1, 0);
+    return ReadEntry(t, visited, 0, parent, depth);
+  }
+
+  bool ReadEntry(const std::vector<uint8_t>& t, std::vector<uint8_t>& visited, uint32_t ordinal, Entry& parent,
+                 int depth) {
+    const size_t p = size_t(ordinal) * 4;
+    if (depth > kMaxDepth || p + 14 > t.size() || p + 14 + t[p + 13] > t.size() || visited[ordinal]) return false;
+    visited[ordinal] = 1;
+    const uint16_t left = Le16(&t[p]), right = Le16(&t[p + 2]);
+    const uint32_t sector = Le32(&t[p + 4]), length = Le32(&t[p + 8]);
+    const uint8_t attr = t[p + 12], name_len = t[p + 13];
+    if (left && !ReadEntry(t, visited, left, parent, depth + 1)) return false;
+    auto e = std::make_unique<Entry>();
+    e->name.assign(reinterpret_cast<const char*>(&t[p + 14]), name_len);
+    e->dir = (attr & 0x10) != 0;
+    if (e->dir) {
+      if (!ReadTable(sector, length, *e, depth + 1)) return false;
+    } else {
+      e->offset = base_ + uint64_t(sector) * kSector, e->size = length;
+      ++files_;
+      if (length && e->offset + e->size > size_) ++past_end_;  // a zero-length file needs no data
+    }
+    parent.children.push_back(std::move(e));
+    return !right || ReadEntry(t, visited, right, parent, depth + 1);
+  }
+
+  static constexpr int kMaxDepth = 1024;
+#ifdef _WIN32
+  std::ifstream f_;
+#else
+  int fd_ = -1;
+
+ public:
+  ~DiscImage() {
+    if (fd_ >= 0) close(fd_);
+  }
+  DiscImage() = default;
+  DiscImage(const DiscImage&) = delete;
+  DiscImage& operator=(const DiscImage&) = delete;
+
+ private:
+#endif
+  uint64_t size_ = 0, base_ = 0;
+  uint64_t files_ = 0, past_end_ = 0, table_bytes_ = 0;
+  std::vector<uint64_t> tables_;
+  Entry root_;
+};
+
+// The game files: a folder (the usual copy) or a disc image file. Paths are relative ("movies\\titantron").
+class GameFiles {
+ public:
+  // Re-opens only when the path changes.
+  void SetRoot(const fs::path& root) {
+    if (root == root_ && opened_) return;
+    root_ = root, opened_ = true, image_.reset(), error_.clear();
+    std::error_code ec;
+    if (!root.empty() && fs::is_regular_file(root, ec)) {
+      image_ = std::make_unique<DiscImage>();
+      if (!image_->Open(root, error_)) image_.reset();
+    }
+  }
+  // Opens the same path again (the file may have been replaced since).
+  void Reopen() {
+    const fs::path root = root_;
+    opened_ = false;
+    SetRoot(root);
+  }
+  const fs::path& root() const { return root_; }
+  bool is_image() const {
+    std::error_code ec;
+    return !root_.empty() && fs::is_regular_file(root_, ec);
+  }
+  // Set when the root is a file that can't be read as a disc image.
+  const std::string& image_error() const { return error_; }
+
+  // Session 98 (DLC in the Arena Viewer): extra READ-ONLY folders searched after the root, in order - the player's DLC packs
+  // (src\assets\dlc_files.h fills them; nothing else sets any, so the launcher's reads are unchanged). A pack names its files after
+  // the disc's with its own suffix ("pac\ch\ch385.pac" -> "pac\ch\ch385_dlc04.pac" in the pack with id 4): a path is tried
+  // literally in each folder, then with the folder's suffix before the extension. Nothing here writes to them.
+  struct Overlay {
+    fs::path root;       // the pack's folder
+    std::string suffix;  // "_dlc04"
+  };
+  void SetOverlays(std::vector<Overlay> o) { overlays_ = std::move(o); }
+  const std::vector<Overlay>& overlays() const { return overlays_; }
+  // "pac\ch\ch385.pac" + "_dlc04" -> "pac\ch\ch385_dlc04.pac" (the suffix goes before the last extension of the file name)
+  static std::string Suffixed(const std::string& rel, const std::string& suffix) {
+    const size_t slash = rel.find_last_of("\\/");
+    const size_t dot = rel.find_last_of('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) return rel + suffix;
+    return rel.substr(0, dot) + suffix + rel.substr(dot);
+  }
+  // The overlay file `rel` resolves to (the first folder that has it: literal, then suffixed); empty when none does.
+  fs::path OverlayPath(const std::string& rel) const {
+    std::error_code ec;
+    for (const Overlay& o : overlays_) {
+      if (o.root.empty()) continue;
+      fs::path p = o.root / Rel(rel);
+      if (fs::is_regular_file(p, ec)) return p;
+      if (!o.suffix.empty() && fs::is_regular_file(p = o.root / Rel(Suffixed(rel, o.suffix)), ec)) return p;
+    }
+    return {};
+  }
+  bool InRoot(const std::string& rel) const {
+    if (is_image()) return image_ && image_->Find(rel);
+    std::error_code ec;
+    return !root_.empty() && fs::exists(root_ / Rel(rel), ec);
+  }
+
+  bool Exists(const std::string& rel) const {
+    if (InRoot(rel)) return true;
+    return !overlays_.empty() && !OverlayPath(rel).empty();
+  }
+
+  // Up to n bytes from the start; empty if missing.
+  std::vector<uint8_t> ReadHead(const std::string& rel, size_t n) {
+    std::vector<uint8_t> out;
+    if (!overlays_.empty() && !InRoot(rel)) {
+      const fs::path p = OverlayPath(rel);
+      if (p.empty()) return out;
+      std::ifstream f(p, std::ios::binary);
+      out.resize(n);
+      f.read(reinterpret_cast<char*>(out.data()), std::streamsize(n));
+      out.resize(size_t(std::max<std::streamsize>(0, f.gcount())));
+      return out;
+    }
+    if (is_image()) {
+      const DiscImage::Entry* e = image_ ? image_->Find(rel) : nullptr;
+      if (!e || e->dir) return out;
+      out.resize(size_t(std::min<uint64_t>(n, e->size)));
+      if (!image_->ReadFile(*e, 0, out.data(), out.size())) out.clear();
+      return out;
+    }
+    std::ifstream f(root_ / Rel(rel), std::ios::binary);
+    out.resize(n);
+    f.read(reinterpret_cast<char*>(out.data()), std::streamsize(n));
+    out.resize(size_t(std::max<std::streamsize>(0, f.gcount())));
+    return out;
+  }
+
+  // Calls `sink` with the whole file in chunks; false if missing or a read failed.
+  bool Stream(const std::string& rel, const std::function<void(const uint8_t*, size_t)>& sink) {
+    std::vector<uint8_t> buf(1 << 20);
+    if (!overlays_.empty() && !InRoot(rel)) {  // Session 98: a DLC pack's file
+      const fs::path p = OverlayPath(rel);
+      if (p.empty()) return false;
+      std::ifstream f(p, std::ios::binary);
+      if (!f) return false;
+      while (f) {
+        f.read(reinterpret_cast<char*>(buf.data()), std::streamsize(buf.size()));
+        if (f.gcount() > 0) sink(buf.data(), size_t(f.gcount()));
+      }
+      return !f.bad();
+    }
+    if (is_image()) {
+      const DiscImage::Entry* e = image_ ? image_->Find(rel) : nullptr;
+      if (!e || e->dir) return false;
+      for (uint64_t pos = 0; pos < e->size;) {
+        const size_t n = size_t(std::min<uint64_t>(buf.size(), e->size - pos));
+        if (!image_->ReadFile(*e, pos, buf.data(), n)) return false;
+        sink(buf.data(), n);
+        pos += n;
+      }
+      return true;
+    }
+    std::ifstream f(root_ / Rel(rel), std::ios::binary);
+    if (!f) return false;
+    while (f) {
+      f.read(reinterpret_cast<char*>(buf.data()), std::streamsize(buf.size()));
+      if (f.gcount() > 0) sink(buf.data(), size_t(f.gcount()));
+    }
+    return !f.bad();  // end of file sets only eof / fail; a read error sets bad
+  }
+
+  // File names (not folders) in a folder of the game files.
+  // Session 98: with overlays, their files are listed too, under the name Exists / Stream take ("ch385_dlc04.pac" -> "ch385.pac":
+  // the folder's suffix dropped), each name once (the root's first).
+  std::vector<std::string> List(const std::string& rel_dir) const {
+    std::vector<std::string> names = ListRoot(rel_dir);
+    for (const Overlay& o : overlays_) {
+      std::error_code ec;
+      if (o.root.empty()) continue;
+      for (const auto& e : fs::directory_iterator(o.root / Rel(rel_dir), ec)) {
+        std::error_code e2;
+        if (!e.is_regular_file(e2)) continue;
+        std::string n = e.path().filename().string();
+        const size_t dot = n.find_last_of('.');
+        const size_t at = dot == std::string::npos ? n.size() : dot;
+        if (!o.suffix.empty() && at >= o.suffix.size() && LowerAscii(n.substr(at - o.suffix.size(), o.suffix.size())) == LowerAscii(o.suffix))
+          n = n.substr(0, at - o.suffix.size()) + n.substr(at);
+        bool dup = false;
+        for (const std::string& x : names) dup = dup || LowerAscii(x) == LowerAscii(n);
+        if (!dup) names.push_back(n);
+      }
+    }
+    return names;
+  }
+  std::vector<std::string> ListRoot(const std::string& rel_dir) const {
+    std::vector<std::string> names;
+    if (is_image()) {
+      const DiscImage::Entry* d = image_ ? image_->Find(rel_dir) : nullptr;
+      if (d && d->dir)
+        for (const auto& c : d->children)
+          if (!c->dir) names.push_back(c->name);
+      return names;
+    }
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(root_ / Rel(rel_dir), ec))
+      if (e.is_regular_file(ec)) names.push_back(e.path().filename().string());
+    return names;
+  }
+
+ private:
+  static std::string LowerAscii(std::string s) {
+    for (char& c : s)
+      if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+    return s;
+  }
+  // Session 71 (Android launcher): the relative paths use the game's backslashes; a POSIX folder needs slashes.
+  static fs::path Rel(const std::string& rel) {
+#ifdef _WIN32
+    return fs::path(rel);
+#else
+    std::string s = rel;
+    std::replace(s.begin(), s.end(), '\\', '/');
+    return fs::path(s);
+#endif
+  }
+  fs::path root_;
+  bool opened_ = false;
+  std::unique_ptr<DiscImage> image_;
+  std::string error_;
+  std::vector<Overlay> overlays_;
+};
+
+}  // namespace launcher

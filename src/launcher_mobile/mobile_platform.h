@@ -1,0 +1,125 @@
+// wwe2k14 phone launcher - what the phone does for it (Session 71). One header, two implementations:
+// platform_android.cpp (calls into LauncherActivity.java over JNI) and platform_desktop.cpp (the PC test build: the
+// same launcher in a phone-shaped window, so it can be checked without a phone).
+//
+// Everything slow or owned by the system (file pickers, copying DLC, the share sheet, GitHub) answers later with an
+// Event; the UI thread collects them with PollEvent once per frame.
+#pragma once
+
+#include <filesystem>
+#include <string>
+#include <vector>
+
+#include "../launcher/update_check.h"
+
+namespace mlauncher {
+// A path as UTF-8 in a std::string (C++20's u8string() is a std::u8string).
+inline std::string U8(const std::filesystem::path& p) {
+  const std::u8string s = p.u8string();
+  return std::string(s.begin(), s.end());
+}
+}  // namespace mlauncher
+
+namespace mlauncher::platform {
+
+namespace fs = std::filesystem;
+
+struct Event {
+  enum Kind {
+    kGamePicked,     // a = the address (content:// or a path), b = the name; ok = false: cancelled
+    kDlcAdded,       // a = what happened (shown)
+    kSavesExported,  // a = what happened
+    kSavesImported,  // a = what happened
+    kUpdate,         // update = GitHub's answer
+    kBack,           // Android's Back gesture
+    kMessage,        // a = text to show
+    kDriverImported, // a = what happened (shown), b = the new driver's folder; ok = false: not imported
+    kUpdateProgress, // Session 81: a = "done total" bytes of the update's download
+    kUpdateDownloaded, // Session 81: ok = downloaded and checked; else a = why not
+    kTronZipPicked,    // Session 98 (IMPORT TRON PREVIEWS): a = the picked zip's address (content:// or a path), b = its name
+    kSongsAdded,       // Lane 286 (MUSIC): a = what happened (shown), b = the theme stem ("" = new songs); ok = false: nothing / not all added
+    kTextEntered,      // Lane 286: a = the text typed in PromptText, b = its tag; ok = false: cancelled
+  } kind = kMessage;
+  bool ok = true;
+  std::string a, b;
+  launcher::UpdateInfo update;
+};
+
+// What the game's activity needs besides the command line (ANDROID_PLAN F1: the touch controls).
+struct TouchChoice {
+  int mode = 0, size = 100, opacity = 70;
+  bool vibrate = false;
+};
+
+void Init(int argc, char** argv);
+// The app's own folder (Android/data/<package>/files on the phone).
+fs::path FilesDir();
+// A name for the platform's log lines ("android" / "desktop").
+const char* Name();
+// Session 72 (Android drivers): the app's native library folder, where the bundled custom Vulkan drivers are
+// (empty on the PC test build: no drivers to offer).
+fs::path NativeLibDir();
+// Session 72 part 8 (a player: "upload their own drivers from their storage"): where the player's own drivers are, one
+// folder each with wwe2k14_driver.json (the phone: internal storage, getFilesDir()/drivers; the external files folder
+// cannot hold loadable code). ImportDriver lets the player pick a driver .zip or .so and copies it there
+// (DriverImport.java), answering with kDriverImported; the PC test build has no import (make the folders by hand).
+fs::path DriversDir();
+void ImportDriver(const fs::path& drivers_dir);
+
+void PickGameFile();
+// A path the launcher can read the picked game file through (the phone: /proc/self/fd/N of a file it opened from the
+// address), or empty when it cannot be opened (moved, deleted, access lost).
+std::string OpenGameFile(const std::string& address);
+// Copies the files the player picks into `dlc_dir` (packs as they sit on the console's drive).
+void AddDlc(const fs::path& dlc_dir);
+// The system's share sheet with these files (logs).
+void Share(const std::vector<fs::path>& files);
+// A .zip of the save folder to a place the player picks / the save folder replaced from one (the old one kept as
+// <save>.before_import).
+void ExportSaves(const fs::path& save_dir);
+void ImportSaves(const fs::path& save_dir);
+// Session 98 (IMPORT TRON PREVIEWS): the system's file picker for the PC launcher's EXPORT FOR PHONE zip (answers kTronZipPicked).
+// OpenPickedZip gives a path the launcher reads it through in place (the phone: /proc/self/fd/N; empty = it cannot be read in place,
+// e.g. a cloud folder that streams), ClosePickedZip lets it go after the import.
+void PickTronZip();
+std::string OpenPickedZip(const std::string& address);
+void ClosePickedZip();
+// Lane 286 (custom music on the phone, MODS > MUSIC): the system file picker for songs (answers kSongsAdded). stem "" = several files
+// copied into `dir` under their own names (NEW SONGS); a stem such as "343" = one file copied as 343.<its extension> (a wrestler's
+// theme). PromptText: a one-line text box (renaming a song), answers kTextEntered with the same tag.
+void PickAudio(const fs::path& dir, const std::string& stem);
+void PromptText(const std::string& title, const std::string& initial, const std::string& tag);
+void CheckForUpdate(const std::string& version);
+// Session 81: the launcher installs its own updates. DownloadUpdate fetches the release's APK (GitHub release downloads only)
+// and checks its SHA-256 (kUpdateProgress ..., then kUpdateDownloaded); InstallUpdate hands the file to Android's installer
+// (the player taps Install); ClearUpdate deletes the downloaded file (the app is up to date).
+void DownloadUpdate(const std::string& url, const std::string& sha256);
+void InstallUpdate();
+void ClearUpdate();
+void OpenUrl(const std::string& url);
+// Starts the game with these arguments (game_address: the picked file, opened by the game's own process) and closes
+// the launcher.
+void StartGame(const std::vector<std::string>& args, const std::string& game_address, const TouchChoice& touch);
+// Session 98 (Arena Viewer phone port, stage C): ARENA VIEWER - ViewerActivity (libviewer.so, its own process) over the launcher with
+// the viewer's arguments (game_address as for StartGame: a "@GAME_FD@" argument becomes the file the viewer's process opens).
+void StartViewer(const std::vector<std::string>& args, const std::string& game_address);
+// Session 74: the touch controls' edit screen (TouchEditActivity) at this Size / Opacity; it saves
+// FilesDir()/touch_layout.txt (no file = the default places).
+void EditTouchLayout(int size, int opacity);
+// Session 93 (M6 step 2): what identifies this phone's GPU stack for the shader precompile's stamp - the build fingerprint
+// (a system update can change the Vulkan driver, and with it the translator's device limits). "desktop" on the PC test build.
+std::string DeviceKey();
+// Session 98: whether the game's process (":game") is alive - the launcher's view of a running tron export (BUILD TRON PREVIEWS
+// can run behind the launcher). Always false on the PC test build.
+bool GameAlive();
+// Session 98 (review): ends the game's process (STOP on a stuck tron export). Nothing on the PC test build.
+void KillGame();
+// Leaves the app (Back on the main page).
+void Quit();
+// The screen's size in pixels, landscape (width >= height).
+void ScreenSize(int& w, int& h);
+
+bool PollEvent(Event& e);
+void Post(Event e);  // any thread
+
+}  // namespace mlauncher::platform

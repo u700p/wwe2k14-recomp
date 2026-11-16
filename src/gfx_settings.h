@@ -1,0 +1,842 @@
+// wwe2k14 - the graphics settings the launcher and the in-game GRAPHICS menu share (Session 28).
+//
+// One source of truth: the launcher's own settings file, %APPDATA%\wwe2k14-launcher\settings.json (written by the
+// launcher with nlohmann::json, so every value is `"key": value`). The launcher keeps writing and reading all of it;
+// this header only touches the keys below, by text, so it works in the game exe (which has no JSON library) and leaves
+// everything else in the file as it was.
+//
+//   upscale      0 off, 1 DLAA, 2 DLSS performance, 3 DLSS quality, 4 DLSS ultra performance,
+//                5 FSR native, 6 FSR quality, 7 FSR performance (Session 33: AMD FSR 3, any graphics card)
+//   resolution   0 720p (the default since Session 95), 1 1440p, 2 4K
+//   draw_height  Session 54 (Jarrod: "360p, 480, 540p, 720p, 1080p, 1440p, and 4k"): 0, or 360 / 480 / 540 / 576 / 600 / 648 (S102 G13; with
+//                resolution 0) or 1080 (with resolution 1): the NATIVE renderer draws at that height and makes its
+//                copies at the resolution's whole size (SDK gpu_native_truth_draw_height). A key of its own, so a
+//                build from before it reads 720p / 1440p (unknown resolution values would clamp to 4K there)
+//   frame_rate   0 classic (30 fps entrances, 60 in matches), 1 60 everywhere (default), 2 high refresh,
+//                3 30 everywhere (Session 37: weak PCs; the launcher only)
+//   refresh_hz   high refresh: game steps per second (0 = the monitor's)
+//   original_look  the original 720p / 30 fps entrance look (Advanced; no MSAA since Session 95)
+//   true_native  Session 87 (Jarrod: "an advanced launcher toggle, called true native"): the whole D3D-layer stack
+//                (--wwe2k14_d3d_owned, src\d3d_owned.h); NATIVE only (Advanced). Session 93 (Jarrod, 2026-11-06):
+//                the default, older files moved to it once (settings_version 4)
+//   texture_filter 0 standard (the game's own filtering since Session 80; the forced 4x before), 1 8x, 2 16x (Session 33)
+//   renderer     0 accurate, 1 light (Session 37), 2 native (Session 41: accurate + the native renderer). Session 51
+//                (Jarrod, 2026-10-22: "NATIVE for everyone"): 2 is the default; ACCURATE and LIGHT are fallbacks
+//   settings_version  Session 51: 2 = the file has had the one-time move of the old default renderer (0) to NATIVE
+//   dlss_dir     the player's own NVIDIA folder (empty = the files next to the game)
+//   post_effects Session 72 (Jarrod, 2026-10-28: "cheaper copy default and then enhanced as an extra option in the
+//                launcher"): NATIVE's final post pass, 0 original (our cheaper copy of the game's, the default), 1
+//                enhanced (the disc-blur depth of field; src\post_swap.h). The launcher only
+//
+// GraphicsFlags() is the mapping from those values to the game's own settings; the launcher puts the result on the
+// command line and the game applies it to itself when it is started without the launcher (wwe2k14_app.h).
+#pragma once
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include "platform/compat.h"  // <windows.h> on Windows (Session 63)
+#if defined(_WIN32)  // Session 63 (Android port): Windows / x86 only
+#include <shlobj.h>
+#endif
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace wwe2k14::gfxs {
+
+namespace fs = std::filesystem;
+
+struct Choice {
+  int upscale = 0;
+  int resolution = 0;  // Session 95 (Jarrod: "720p the default resolution"): a file without the key reads 720p; 1 1440p, 2 4K
+  int frame_rate = 1;
+  int refresh_hz = 0;
+  bool original_look = false;
+  int texture_filter = 0;  // Session 33
+  int draw_height = 0;     // Session 54: 0, 360 / 480 / 540 / 576 / 600 / 648 (resolution 0), 1080 (resolution 1); NATIVE only
+  int renderer = 2;        // Session 37: 0 accurate, 1 light (--wwe2k14_light_renderer); Session 41: 2 native
+                           // (the accurate renderer with the native renderer drawing the scene, --gpu_native=2);
+                           // Session 51: 2 by default (Jarrod: "NATIVE for everyone")
+  int post_effects = 0;    // Session 72: 0 original (our copy of the game's pass), 1 enhanced; NATIVE only
+  // Session 85 (Jarrod: individual graphics settings; launcher only, NATIVE only; defaults = today's look)
+  bool shadows = true;         // false: no dynamic shadows (gpu_dynamic_shadows)
+  bool depth_of_field = true;  // false: no depth-of-field blur (gpu_depth_of_field)
+  int crowd_density = 100;     // 0..100 in steps of 10 (gpu_scene_crowd_density)
+  // Settings parity (Session 100, Jarrod 2026-11-11 08:1x; launcher only; the new renderer reads them, reader.h):
+  bool film_grain = true;      // S3: false = the 30 Years mode's old-film pass drawn clean (--wwe2k14_film_grain=false)
+  bool vsync = true;           // S13: V-SYNC, how pictures reach the screen (--wwe2k14_vsync=false); never the game's pace
+  // Session 93 (Jarrod: the low-end tier is chosen automatically from the GPU class, with a launcher override):
+  // quality_tier is the player's setting (0 AUTO, 1 LOW, 2 STANDARD; the launcher's QUALITY row); `low` is the RESOLVED
+  // tier for this start (ResolveQualityTier, set by whoever builds the flags: the launcher with the card the game will
+  // use, the game's own settings-file path likewise). GraphicsFlags only reads `low`.
+  int quality_tier = 0;
+  bool low = false;
+  // Session 95 (item K): LOW also draws the wrestlers' shadow maps on alternate frames, smaller, and skips the passes that read only
+  // those maps. Set by the game from --wwe2k14_low_shadows (default false until the Session 95 milestone judges the look); the launcher leaves it false.
+  bool low_shadows = false;
+  bool display_720p = false;   // Session 95 (route #7): 1280x720 desktop while playing (--wwe2k14_display_720p); launcher Advanced, off
+  bool true_native = true;     // Session 87: the D3D-layer stack (--wwe2k14_d3d_owned); launcher Advanced, NATIVE only.
+                               // Session 93 (Jarrod): on by default (Parse: the one-time move of older files)
+  std::string dlss_dir;
+  bool operator==(const Choice& o) const {
+    return upscale == o.upscale && resolution == o.resolution && draw_height == o.draw_height &&
+           frame_rate == o.frame_rate && texture_filter == o.texture_filter && shadows == o.shadows &&
+           depth_of_field == o.depth_of_field && crowd_density == o.crowd_density && quality_tier == o.quality_tier &&
+           low == o.low;
+  }
+};
+
+// The launcher's settings file (rex: Roaming AppData).
+inline fs::path DefaultSettingsPath() {
+  PWSTR appdata = nullptr;
+  fs::path dir;
+  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) dir = appdata;
+  CoTaskMemFree(appdata);
+  if (dir.empty()) dir = fs::temp_directory_path();
+  return dir / "wwe2k14-launcher" / "settings.json";
+}
+
+inline std::string ReadFile(const fs::path& p) {
+  std::ifstream f(p, std::ios::binary);
+  if (!f) return {};
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+// "key": <integer>  ->  true and the value; false when the key is absent.
+inline bool GetInt(const std::string& json, const char* key, int& out) {
+  const std::regex re(std::string("\"") + key + "\"\\s*:\\s*(-?\\d+)");
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) return false;
+  out = std::atoi(m[1].str().c_str());
+  return true;
+}
+inline bool GetBool(const std::string& json, const char* key, bool& out) {
+  const std::regex re(std::string("\"") + key + "\"\\s*:\\s*(true|false)");
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) return false;
+  out = m[1].str() == "true";
+  return true;
+}
+inline bool GetString(const std::string& json, const char* key, std::string& out) {
+  const std::regex re(std::string("\"") + key + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) return false;
+  std::string raw = m[1].str(), s;
+  for (size_t i = 0; i < raw.size(); ++i) {
+    if (raw[i] == '\\' && i + 1 < raw.size()) {
+      ++i;
+      s += raw[i] == 'n' ? '\n' : raw[i] == 't' ? '\t' : raw[i];
+    } else {
+      s += raw[i];
+    }
+  }
+  out = s;
+  return true;
+}
+
+// Session 51 (Jarrod, 2026-10-22: "NATIVE for everyone"): the settings version whose files already had the one-time
+// move of the old default renderer to NATIVE. A file below it with renderer 0 (ACCURATE, the default until Session 50)
+// reads as NATIVE; LIGHT and NATIVE stay as they are. The launcher writes the version back with its next save, so an
+// ACCURATE picked by hand after that stays (one picked by hand before it cannot be told from the old default).
+// Session 54: version 3 = the file has had the launcher's one-time device moves (launcher_main.cpp MigrateForDevice:
+// LIGHT -> NATIVE on a card without interlock, 720p -> 540p on integrated graphics with NATIVE).
+// Session 93: version 4 = the file has had the one-time move to TRUE NATIVE (Parse, launcher_core.h LoadSettings).
+inline constexpr int kSettingsVersion = 4;
+inline int MigrateRenderer(const std::string& json, int renderer) {
+  int version = 0;
+  GetInt(json, "settings_version", version);
+  (void)version;  // (Session 51's move: files from before version 2 with renderer 0)
+  (void)renderer;
+  // Session 61 (Jarrod, 2026-10-25: "remove the renderer option entirely, with light and accurate as advanced flags
+  // only"): the file's renderer is not a choice any more - always NATIVE; LIGHT / ACCURATE only through
+  // --wwe2k14_renderer=light|accurate (RendererFromFlags).
+  return 2;
+}
+
+// Session 61: the advanced flag --wwe2k14_renderer=native|light|accurate in a flag string (the launcher's Extra flags)
+// -> 2 / 1 / 0; -1 when it is not there (or names no renderer).
+inline int RendererFromFlags(const std::string& flags) {
+  const std::string key = "--wwe2k14_renderer=";
+  const size_t at = flags.rfind(key);
+  if (at == std::string::npos || (at > 0 && flags[at - 1] != ' ')) return -1;
+  const size_t start = at + key.size();
+  const std::string value = flags.substr(start, flags.find(' ', start) == std::string::npos
+                                                    ? std::string::npos
+                                                    : flags.find(' ', start) - start);
+  return value == "native" ? 2 : value == "light" ? 1 : value == "accurate" ? 0 : -1;
+}
+
+// Session 85: crowd density to 0..100 in steps of 10 (rounded to the nearest step).
+inline int RoundCrowdDensity(int v) { return (std::clamp(v, 0, 100) + 5) / 10 * 10; }
+
+// Which of the keys the file has (a key that is absent says nothing: the caller keeps what the game is running).
+struct Present {
+  bool upscale = false, resolution = false, frame_rate = false, refresh_hz = false, original_look = false;
+  bool texture_filter = false;
+  bool draw_height = false;  // Session 54
+};
+
+// Session 54: the resolutions in menu order - the file's `resolution` (the whole size copies are made at) and
+// `draw_height` (0: that size; else what NATIVE draws at). native_only: the other renderers draw only whole sizes.
+struct ResolutionEntry {
+  const char* name;
+  int resolution, draw_height;
+  bool native_only;
+  bool in_game_menu = true;  // S102 G13: false = the launcher's list only (the in-game GRAPHICS row has 8 value slots); a file that holds it still shows it there
+};
+// S102 G13 (Surface: 720 drawn = 50.0 fps, 540 drawn = 55.6 fps in Bryan's entrance at AUTO = LOW): 576 / 600 / 648 between 540P and 720P, NATIVE only,
+// resolution 0, no default changes. The scale is draw_height / 720 everywhere (reader.h render_scale, the SDK's OwnedRowRatio / TruthDrawRatio), exact in float
+// for each (tools\g13\g13_check.py).
+inline constexpr ResolutionEntry kResolutions[] = {{"360P", 0, 360, true},         {"480P", 0, 480, true},
+                                                   {"540P", 0, 540, true},         {"576P", 0, 576, true, false},
+                                                   {"600P", 0, 600, true, false},  {"648P", 0, 648, true, false},
+                                                   {"720P", 0, 0, false},          {"1080P", 1, 1080, true},
+                                                   {"1440P", 1, 0, false},         {"4K", 2, 0, false}};
+inline constexpr int kResolutionCount = int(std::size(kResolutions));
+// The draw height that goes with a resolution, or 0.
+inline int ValidDrawHeight(int resolution, int draw_height) {
+  for (const ResolutionEntry& e : kResolutions)
+    if (e.draw_height && e.draw_height == draw_height && e.resolution == resolution) return draw_height;
+  return 0;
+}
+// The menu entry of a (resolution, draw height) pair; one NATIVE alone can draw shows as its whole size otherwise.
+inline int ResolutionIndex(int resolution, int draw_height, bool native = true) {
+  if (!native) draw_height = 0;
+  for (int i = 0; i < kResolutionCount; ++i)
+    if (kResolutions[i].resolution == resolution && kResolutions[i].draw_height == draw_height) return i;
+  for (int i = 0; i < kResolutionCount; ++i)
+    if (kResolutions[i].resolution == resolution && !kResolutions[i].draw_height) return i;
+  for (int i = 0; i < kResolutionCount; ++i)  // S102 G13: by name, not a position (the list grew)
+    if (kResolutions[i].resolution == 1 && !kResolutions[i].draw_height) return i;  // 1440p
+  return 0;
+}
+
+inline Present Parse(const std::string& json, Choice& c) {
+  Present p;
+  p.upscale = GetInt(json, "upscale", c.upscale);
+  p.resolution = GetInt(json, "resolution", c.resolution);
+  p.frame_rate = GetInt(json, "frame_rate", c.frame_rate);
+  p.refresh_hz = GetInt(json, "refresh_hz", c.refresh_hz);
+  p.original_look = GetBool(json, "original_look", c.original_look);
+  p.texture_filter = GetInt(json, "texture_filter", c.texture_filter);
+  p.draw_height = GetInt(json, "draw_height", c.draw_height);  // Session 54
+  GetInt(json, "renderer", c.renderer);  // Session 37 (the launcher's Settings -> Graphics; not in the game's menu)
+  c.renderer = MigrateRenderer(json, c.renderer);  // Session 51
+  GetString(json, "dlss_dir", c.dlss_dir);
+  GetInt(json, "post_effects", c.post_effects);  // Session 72 (the launcher's Settings -> Graphics)
+  c.post_effects = std::clamp(c.post_effects, 0, 1);
+  // Session 85: missing keys keep the defaults (shadows on, depth of field on, crowd 100%).
+  GetBool(json, "shadows", c.shadows);
+  GetBool(json, "display_720p", c.display_720p);  // Session 95
+  GetBool(json, "depth_of_field", c.depth_of_field);
+  GetInt(json, "crowd_density", c.crowd_density);
+  GetBool(json, "film_grain", c.film_grain);  // Session 100 settings parity S3 (a missing key = on, the game's look)
+  GetBool(json, "vsync", c.vsync);            // S13 (a missing key = on)
+  c.crowd_density = RoundCrowdDensity(c.crowd_density);
+  GetInt(json, "quality_tier", c.quality_tier);  // Session 93: a missing key = 0 AUTO (no settings_version bump)
+  c.quality_tier = std::clamp(c.quality_tier, 0, 2);
+  // Session 87 (launcher Advanced). Session 93 (Jarrod, 2026-11-06 01:1x: "True native should become the default, even
+  // retroactively ... we'll still have the toggle for it"): a launcher file (it carries settings_version) from before
+  // version 4 moves to TRUE NATIVE once (the launcher writes version 4 back with its next save, so an OFF picked after
+  // that stays); a file without the key and without a version (hand-made test settings, out\owned_check\*.json) keeps it
+  // off as before; no file at all = the default (on).
+  if (!json.empty()) {
+    bool true_native = false;
+    GetBool(json, "true_native", true_native);
+    int version = 0;
+    if (GetInt(json, "settings_version", version) && version < 4) true_native = true;
+    c.true_native = true_native;
+  }
+  c.upscale = std::clamp(c.upscale, 0, 7);
+  c.resolution = std::clamp(c.resolution, 0, 2);
+  c.draw_height = ValidDrawHeight(c.resolution, c.draw_height);
+  c.frame_rate = std::clamp(c.frame_rate, 0, 3);  // Session 37: 3 = 30 everywhere (weak PCs)
+  c.texture_filter = std::clamp(c.texture_filter, 0, 2);
+  c.renderer = std::clamp(c.renderer, 0, 2);  // Session 41: 2 native
+  return p;
+}
+
+// A path as UTF-8 text. path::string() converts to the ANSI code page and throws for a name that page cannot hold (a
+// Windows user name with other letters in it); u8string() cannot (Session 28 review).
+inline std::string Utf8(const fs::path& p) {
+  const auto u = p.u8string();
+  return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+}
+
+// Sets a true / false key that is already in the JSON text (nothing is added when it is not there).
+inline std::string SetBoolIfPresent(std::string json, const char* key, bool value) {
+  const std::regex re(std::string("(\"") + key + "\"\\s*:\\s*)(true|false)");
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) return json;
+  return json.substr(0, size_t(m.position(2))) + (value ? "true" : "false") + json.substr(size_t(m.position(2) + m.length(2)));
+}
+
+// Sets (or adds) an integer key in the JSON text, leaving the rest as it was.
+inline std::string SetInt(std::string json, const char* key, int value) {
+  const std::regex re(std::string("(\"") + key + "\"\\s*:\\s*)(-?\\d+)");
+  std::smatch m;
+  if (std::regex_search(json, m, re))  // spliced by hand: "$1" + digits would read as group 13 and so on
+    return json.substr(0, size_t(m.position(2))) + std::to_string(value) + json.substr(size_t(m.position(2) + m.length(2)));
+  const size_t brace = json.find('{');
+  const std::string entry = std::string("\"") + key + "\": " + std::to_string(value);
+  if (brace == std::string::npos) return "{\n  " + entry + "\n}\n";
+  const size_t next = json.find_first_not_of(" \t\r\n", brace + 1);
+  const bool empty_object = next == std::string::npos || json[next] == '}';
+  return json.substr(0, brace + 1) + "\n  " + entry + (empty_object ? "" : ",") + json.substr(brace + 1);
+}
+
+// Session 37: sets (or adds) a string key in the JSON text ("..." with \ and " escaped, control characters dropped).
+inline std::string SetString(std::string json, const char* key, const std::string& value) {
+  std::string esc;
+  for (char ch : value) {
+    if (ch == '"' || ch == '\\') esc += '\\', esc += ch;
+    else if (static_cast<unsigned char>(ch) >= 0x20) esc += ch;
+  }
+  const std::regex re(std::string("(\"") + key + "\"\\s*:\\s*)\"(?:[^\"\\\\]|\\\\.)*\"");
+  std::smatch m;
+  if (std::regex_search(json, m, re))
+    return json.substr(0, size_t(m.position(0) + m.length(1))) + "\"" + esc + "\"" +
+           json.substr(size_t(m.position(0) + m.length(0)));
+  const size_t brace = json.find('{');
+  const std::string entry = std::string("\"") + key + "\": \"" + esc + "\"";
+  if (brace == std::string::npos) return "{\n  " + entry + "\n}\n";
+  const size_t next = json.find_first_not_of(" \t\r\n", brace + 1);
+  const bool empty_object = next == std::string::npos || json[next] == '}';
+  return json.substr(0, brace + 1) + "\n  " + entry + (empty_object ? "" : ",") + json.substr(brace + 1);
+}
+
+// Session 37: writes the JSON text back the way Save does (temp file + rename, the old file never deleted first).
+inline bool WriteJson(const fs::path& path, const std::string& json) {
+  std::error_code ec;
+  fs::create_directories(path.parent_path(), ec);
+  fs::path tmp = path;
+  tmp += L".tmp";
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f << json;
+    if (!f) return false;
+  }
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    ec.clear();
+    fs::rename(tmp, path, ec);
+    if (!ec) return true;
+    Sleep(50);
+  }
+  fs::remove(tmp, ec);
+  return false;
+}
+
+// Writes the three choices into the file (created with the folder when it does not exist). Temp file + rename, so a
+// launcher reading at the same moment sees the old or the new file, never half of one. The rename replaces the old
+// file in one step (retried a few times when something such as a virus scanner has the new file open); the old file
+// is never deleted first, so a failed save leaves it as it was. "original_look": true in the file would make the game
+// ignore resolution and frame rate on every start, so choosing them here turns it off (`cleared` says so).
+inline bool Save(const fs::path& path, const Choice& c, bool* cleared = nullptr) {
+  std::error_code ec;
+  fs::create_directories(path.parent_path(), ec);
+  std::string json = ReadFile(path);
+  bool was_original = false;
+  if (cleared) *cleared = false;
+  if (GetBool(json, "original_look", was_original) && was_original) {
+    json = SetBoolIfPresent(json, "original_look", false);
+    if (cleared) *cleared = true;
+  }
+  json = SetInt(json, "upscale", c.upscale);
+  json = SetInt(json, "resolution", c.resolution);
+  json = SetInt(json, "draw_height", ValidDrawHeight(c.resolution, c.draw_height));  // Session 54
+  json = SetInt(json, "frame_rate", c.frame_rate);
+  json = SetInt(json, "refresh_hz", c.refresh_hz);  // Session 31: 120 vs UNCAPPED (the monitor's rate, 0)
+  json = SetInt(json, "texture_filter", c.texture_filter);  // Session 33
+  fs::path tmp = path;
+  tmp += L".tmp";
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f << json;
+    if (!f) return false;
+  }
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    ec.clear();
+    fs::rename(tmp, path, ec);
+    if (!ec) return true;
+    Sleep(50);
+  }
+  fs::remove(tmp, ec);
+  return false;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Machine facts.
+
+// An NVIDIA RTX card (DLSS / DLAA), by DXGI (the same test the launcher uses).
+inline bool HasRtxCard() {
+  bool rtx = false;
+#if defined(_WIN32)  // Session 63 (Android port): DXGI is Windows only; no RTX card on a phone
+  using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+  if (HMODULE dxgi = LoadLibraryW(L"dxgi.dll")) {
+    auto create = reinterpret_cast<CreateFactoryFn>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
+    struct Factory;  // the interface is used through its COM vtable below, without the DXGI headers
+    void* factory = nullptr;
+    // IID_IDXGIFactory1 = 770aae78-f26f-4dba-a829-253c83d1b387
+    static const GUID iid = {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};
+    if (create && SUCCEEDED(create(iid, &factory)) && factory) {
+      // IDXGIFactory1::EnumAdapters1 is vtable slot 12; IDXGIAdapter1::GetDesc1 slot 10; Release slot 2.
+      auto vt = [](void* o) { return *reinterpret_cast<void***>(o); };
+      for (UINT i = 0;; ++i) {
+        void* adapter = nullptr;
+        using EnumFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT, void**);
+        if (FAILED(reinterpret_cast<EnumFn>(vt(factory)[12])(factory, i, &adapter)) || !adapter) break;
+        struct Desc1 {
+          WCHAR Description[128];
+          UINT VendorId, DeviceId, SubSysId, Revision;
+          SIZE_T Dedicated, DedicatedSys, Shared;
+          LUID Luid;
+          UINT Flags;
+        } d{};
+        using GetDescFn = HRESULT(STDMETHODCALLTYPE*)(void*, Desc1*);
+        if (SUCCEEDED(reinterpret_cast<GetDescFn>(vt(adapter)[10])(adapter, &d)) && !(d.Flags & 2u)) {
+          char name[128];
+          WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name), nullptr, nullptr);
+          if (d.VendorId == 0x10DE && std::string(name).find("RTX") != std::string::npos) rtx = true;
+        }
+        using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(void*);
+        reinterpret_cast<ReleaseFn>(vt(adapter)[2])(adapter);
+      }
+      using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(void*);
+      reinterpret_cast<ReleaseFn>(vt(factory)[2])(factory);
+    }
+  }
+#endif  // _WIN32
+  return rtx;
+}
+
+// The main monitor's refresh rate.
+inline int MonitorHz() {
+#if defined(_WIN32)
+  DEVMODEW dm{};
+  dm.dmSize = sizeof(dm);
+  if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) return int(dm.dmDisplayFrequency);
+#endif  // Session 63 (Android port): 60 there until ANDROID_PLAN F5 picks the phone's rate
+  return 60;
+}
+
+// Session 33: the upscale value is one of the FSR modes / one of the NVIDIA ones (DLAA or DLSS).
+inline bool IsFsr(int upscale) { return upscale >= 5 && upscale <= 7; }
+inline bool IsNvidia(int upscale) { return upscale >= 1 && upscale <= 4; }
+inline fs::path ExeFolder();
+// AMD's FSR runtime next to the game (shipped with a release; copied by the build).
+inline bool HasFsrRuntime() {
+  std::error_code ec;
+  return fs::is_regular_file(ExeFolder() / "amd_fidelityfx_vk.dll", ec);
+}
+
+inline fs::path ExeFolder() {
+  wchar_t buf[MAX_PATH * 2];
+  GetModuleFileNameW(nullptr, buf, DWORD(std::size(buf)));
+  return fs::path(buf).parent_path();
+}
+
+// Where the NVIDIA Streamline runtime is: the player's own folder, else the files next to the game (a release:
+// nvidia\ beside the exe; the dev layout: the exe's folder). Empty when there is none.
+inline std::string StreamlineDir(const std::string& explicit_dir, const std::string& settings_dir) {
+  std::error_code ec;
+  auto has = [&](const fs::path& d) { return !d.empty() && fs::is_regular_file(d / "sl.interposer.dll", ec); };
+  if (!explicit_dir.empty()) return explicit_dir;  // a flag the player or the launcher gave: used as is
+  if (!settings_dir.empty() && has(fs::path(settings_dir))) return settings_dir;
+  const fs::path here = ExeFolder();
+  if (has(here / "nvidia")) return Utf8(here / "nvidia");
+  if (has(here)) return Utf8(here);
+  return {};
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Session 93 (Jarrod, 2026-11-06 00:48: "the low-end quality tier is chosen AUTOMATICALLY from the GPU class (phone /
+// iGPU / desktop) with a launcher override"): the setting (0 AUTO, 1 LOW, 2 STANDARD) -> the tier this start runs, 1 LOW
+// or 2 STANDARD. AUTO is LOW on a phone (every Android device for now; the SDK's `gpu_class` cvar, set from its quirks
+// table at device creation, can refine that later) and on an integrated PC GPU (vk_devices.h integrated()), else
+// STANDARD. `why` gets the text for the game log ("[wwe2k14] quality tier: LOW (auto: integrated GPU <name>)").
+inline int ResolveQualityTier(int setting, bool phone, bool integrated, const std::string& gpu_name, std::string* why = nullptr) {
+  int tier = 2;
+  std::string text;
+  if (setting == 1) tier = 1, text = "chosen in the launcher";
+  else if (setting == 2) tier = 2, text = "chosen in the launcher";
+  else if (phone) tier = 1, text = "auto: phone";
+  else if (integrated) tier = 1, text = "auto: integrated GPU " + gpu_name;
+  else tier = 2, text = "auto: " + (gpu_name.empty() ? std::string("desktop GPU") : "GPU " + gpu_name);
+  if (why) *why = std::string(tier == 1 ? "LOW" : "STANDARD") + " (" + text + ")";
+  return tier;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Session 95 (Jarrod, 2026-11-06: "The individual settings take priority but yes they start with our safe low defaults"):
+// the LOW tier's player-visible values, written ONCE into the settings the player sees (first-run auto-detect when the
+// tier resolves LOW, or the player picking LOW in the launcher). After that the sliders are the player's. Only what is
+// still at the normal value moves: a 1440p pick without an upscaler or drawing size -> 720p (4K, 1080p, a drawing size
+// and an upscaler are hand picks; 720p is the default since Session 95, so this only moves a file that says 1440p),
+// crowd 100% -> 70%. Returns true when something moved; `what` gets the log text.
+inline constexpr int kLowStartCrowd = 70;
+inline bool LowStartValues(int& resolution, int& draw_height, int upscale, int& crowd_density, std::string* what = nullptr) {
+  bool moved = false;
+  std::string text;
+  if (upscale == 0 && draw_height == 0 && resolution == 1) resolution = 0, moved = true, text += " resolution 1440p->720p";
+  if (crowd_density >= 100) crowd_density = kLowStartCrowd, moved = true, text += " crowd 100->70";
+  if (what) *what = text.empty() ? " (already at or below the safe values)" : text;
+  return moved;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The mapping to the game's settings (the same flags the launcher builds). Each pair is {setting name, value}.
+
+// What the NATIVE renderer is (Session 51: one list for the launcher's NATIVE, the settings file and the game's
+// --wwe2k14_preset_low, which keeps only its 720p / 30 fps part besides).
+inline std::vector<std::pair<std::string, std::string>> NativeRendererFlags() {
+  return {
+      // Session 41 (low-spec step 2): the accurate renderer with the native renderer drawing the scene. The SDK turns it
+      // off by itself where the accurate path cannot run (no interlock: the light renderer's path and fixes).
+      {"gpu_native", "2"},
+      // Low-spec step 3: exact cheap clears (resolve hashes identical, runs 2725-2732).
+      {"gpu_fast_clear", "true"},
+      // Session 47 (Jarrod, 2026-10-22: the playtest zip "with our fully native GPU renderer"): truth frames (no EDRAM;
+      // the SDK refuses them itself with DLSS / DLAA and needs gpu_native 2, so the light renderer and cards without
+      // interlock are unaffected).
+      {"gpu_native_truth", "true"},
+      // Session 50 (Jarrod, 2026-10-22: "We'll turn it on"): the D3D library's GPR-flush point draws not executed
+      // (Session 48: pictures and hashes identical, command thread -4.3%).
+      {"gpu_native_half2_skip_gpr_draws", "true"},
+      // Session 50 step 1 (Jarrod, 2026-10-22: "Turn step 1 on"): the lean draw path and the geometry-page trust
+      // (docs\native\LEAN_DRAWS.md: exclusive A/B 3410, command thread -14.3% match; the lean path acts only in truth
+      // frames).
+      {"gpu_native_half2", "2"},
+      {"gpu_native_lean_draws", "true"},
+      {"gpu_native_trust_geometry_pages", "true"},
+      // Session 49's texture-only resolves (Jarrod, 2026-10-22 ~18:40: "Switch it on now"): resolves whose output only a
+      // texture reads skip their write-back into guest memory (exclusive A/B 3377 at 720p: GPU -9.0% Brock, -7.8%
+      // Bryan, -12.2% match; pictures and resolve hashes identical; 1x only - no effect at a resolution scale yet).
+      {"gpu_native_truth_skip_writeback", "true"},
+      // Session 52 step 1 (docs\native\PERF_S52.md: the NATIVE frame is drains between small steps, the 4090's SMs 94%
+      // idle): barriers held back and joined until the next GPU work; the native renderer's own timestamps off; at a
+      // resolution scale the RGBA8 resolves straight from the truth image (no staging buffer); packed texture fills
+      // straight into the texture's storage view; 1x direct-load textures (storage view) for the resolve kinds even
+      // before their page's first resolve, so most resolves become texture-only (13.8 -> 43.5 a match frame). Pictures
+      // 6 / 6 identical (3544 / 3543 at 1440p, 3552 / 3546 at 720p), resolve hashes 467 / 467 vs 3131 (3554); the
+      // direct 1x texture loads (Session 44, LOW's) now for NATIVE at every frame rate - the texture-only resolves need
+      // them.
+      {"vulkan_merge_adjacent_barriers", "true"},
+      {"gpu_native_gpu_timers", "false"},
+      {"gpu_native_truth_direct_resolve_scaled", "true"},
+      {"gpu_native_truth_fill_direct", "true"},
+      {"vulkan_texture_load_direct_unscaled", "true"},
+      {"vulkan_texture_load_direct_unscaled_any_page", "true"},
+      // Session 52 step 2: at a resolution scale the full k_16_16 / k_16_16_16_16 resolves straight from the truth
+      // image too, and the RGBA8 ones also write the scaled texture they feed (no reload from the scaled buffer); at 1x
+      // a texture-only resolve records no shared-memory use (no barriers for it). Pictures 6 / 6 identical (3557, 3575,
+      // 3567), resolve hashes 467 / 467 (3568); exclusive A/B 3577 at 1440p -2.6 / -2.2 / -3.0%, 720p neutral (3576).
+      {"gpu_native_truth_direct_resolve_scaled_full", "true"},
+      {"gpu_native_truth_direct_resolve_scaled_texture", "true"},
+      {"gpu_native_truth_defer_dest_use", "true"},
+      // Session 52 step 2e: at a resolution scale the k_8 / k_4_4_4_4 resolves fill their textures (the mip chains are
+      // no longer reloaded from the scaled buffer after each level: ~10 loads, 62 MB a 1440p match frame); the other
+      // kinds stay off (no gain, 3590 / 3591). Pictures 6 / 6 identical (3589); A/B 3587 fast-forwarded -19 / -10 / -16%,
+      // exclusive 3592 -1.5 / -4.9 / -5.5%.
+      {"gpu_native_truth_texture_fill_scaled", "true"},
+      {"gpu_native_truth_texture_fill_scaled_kinds", "32"},
+      // Session 52 step 3 (1x): texture-only resolves recorded later in batches with their texture barriers, and a
+      // clear-first pass on an image such a resolve reads takes a pooled image (the pixels outside the clear copied
+      // from the original at the flush). Pictures 6 / 6 identical (3602, 3608), resolve hashes 467 / 467 (3603, 3607);
+      // exclusive A/B 3609 at 720p -3.1 / -4.1 / -7.4%; reviewed (no route bug, 5 hardening fixes in SDK 4dead3e).
+      {"gpu_native_truth_batch_resolves", "true"},
+      {"gpu_native_truth_batch_rename", "true"},
+      // Session 56 step 1 (the truth passes' render pass dependencies were a GPU wait each, and the match's scene pass
+      // was split 7 times): truth passes without external dependencies, their synchronisation as image barriers only
+      // where needed; a clear-first pass that renames its colour image renames its depth image too (the tiny
+      // clear-first passes no longer share one); textures written by compute or copies made sampleable before a pass
+      // opens. Pictures 6 / 6 byte-identical (3774 / 3775), resolve hashes 467 / 467 (3776 / 3777); in-run A/B 3778
+      // (720p, fast-forwarded): Brock -13.3%, Bryan -5.9%, match -18.0%; reviewed (5 fixes, SDK acfe491).
+      {"gpu_native_truth_lazy_pass_deps", "true"},
+      {"gpu_native_truth_lazy_pass_style", "1"},
+      {"gpu_native_truth_rename_depth", "true"},
+      {"vulkan_texture_sample_written_early", "true"},
+      // Session 56 step 3a: lean draws are not sent to the full IssueDraw for writes that change nothing they keep
+      // (SHADER_CONSTANT_FLUSH_FETCH_*, shader loads, INVALIDATE_STATE): "state written" draws ~290 -> ~160 a match
+      // frame; pictures 6 / 6 identical (3783), hashes 467 / 467 (3782); command thread match -3.3% (3781).
+      {"gpu_native_lean_benign_writes", "true"},
+      // Session 56 step 1f: texture-only resolves at a resolution scale too (the scaled resolve buffer written from the
+      // texture only when something reads it), so batching and renames work at 1440p / 4K: pictures 1440p
+      // byte-identical (3821), hashes 467 / 467 (3827); in-run A/B 1440p match -14.4% / -10.4%, Bryan -4.3% / -5.8%
+      // (3822 / 3826); reviewed (64-bit offsets for 4K, the readback reader, SDK fixes).
+      {"gpu_native_truth_skip_writeback_scaled", "true"},
+      // Session 59: at a resolution scale a resolve's write use of the scaled resolve buffer is held until a dispatch
+      // writes it (texture-only scaled resolves: none, so the truth passes around them need no barrier: 1440p 1 -> 21
+      // free passes a match frame); texture fills into a storage view join the batch of texture-only resolves.
+      // In-run A/Bs: 3963 (1440p) Brock -9.3%, Bryan -3.0%, match -8.2%; 3974 (720p) match -3.4%, command thread -2.3%.
+      // Pictures 6 / 6 byte-identical at 720p and 1440p (3984 / 3986, 3987 / 3988), resolve hashes 467 / 467 (3989 /
+      // 3990, 3991 / 3992); reviewed (fixes dfa7bd1, 063a235).
+      {"gpu_native_truth_defer_dest_use_scaled", "true"},
+      {"gpu_native_truth_batch_fills", "true"},
+      // Session 59 step 1b: at a resolution scale the full k_16_16 / k_16_16_16_16 copies (the shadow atlas parts) also
+      // write the scaled texture they feed - 1440p texture reloads 5 -> 0-1 a match frame (42 -> 0-14 MB). Pictures 6 / 6
+      // byte-identical at 1440p (4009 vs 3987), resolve hashes 467 / 467 (4010 vs 3991); A/B 4011 (1440p): match -4.0%,
+      // Bryan -3.2%, Brock -19.3%.
+      {"gpu_native_truth_direct_resolve_scaled_full_texture", "true"},
+      // Session 59 step 1d: at 1x the full k_8 / k_4_4_4_4 copies (shadow maps, a mip chain) straight from the RGBA8
+      // truth image into memory - staged resolves 11.2 -> 1.0 a 720p match frame. Resolve hashes 467 / 467 (4019 vs
+      // 3989), pictures 6 / 6 byte-identical (4020 vs 3984); A/B 4021 (720p): match -3.8%, Brock -10.1%, Bryan -0.5%.
+      {"gpu_native_truth_direct_resolve_full_1x", "true"},
+      // Session 59 medium items a / b (Jarrod: "Do the medium"): 1x k_8 textures get an R8_UINT storage view, and the
+      // k_8 and depth texture fills write the texture through its storage view (no staging buffer, no buffer copy);
+      // the 1x depth copy goes straight from the depth image into memory (no staging stores, no stock copy): staged
+      // resolves 1.0 -> 0 and storage-view fills 12.6 -> 17.5 a 720p match frame (census 4041). Resolve hashes 467 / 467
+      // (4051 vs 3989, 4052 vs 3991), pictures 6 / 6 byte-identical at 720p and 1440p (4053 vs 3984, 4054 vs 3987);
+      // reviewed (fixes SDK e03ea01). In-run A/Bs (720p): 4045 match -11.4%, Brock -13.7%, Bryan +0.3%; 4055 match
+      // -9.6%, Brock -10.9%, Bryan -12.6%.
+      {"vulkan_texture_native_storage_small", "true"},
+      {"gpu_native_truth_fill_direct_small", "true"},
+      {"gpu_native_truth_fill_direct_depth", "true"},
+      {"gpu_native_truth_direct_resolve_depth", "true"},
+      // Session 59 medium item c: at a resolution scale the k_8 / k_4_4_4_4 copies straight into the scaled resolve
+      // buffer (the stock scaled layout), and the depth copy above at a scale too: 1440p staged write-backs 12.6 -> 1.0
+      // (entrances), 11.9 -> 0 (match) a frame (4060 / 4061). Exact as above (1440p 4052, 4054). Timed census 4062 /
+      // 4063 (native GPU timers): write-backs 0.854 -> 0.708 ms a frame (entrances), match 0.459 -> 0.480 (noise: the
+      // untouched fills moved 0.03); 1440p in-run A/Bs too noisy to read (4056 - 4059).
+      {"gpu_native_truth_direct_resolve_scaled_small", "true"},
+      // Session 56 (Jarrod, 2026-10-24 09:05: "let's have it on for native"): the per-draw constants in the GPU's
+      // host-visible memory (the BAR window when there is no Resizable BAR) instead of system memory read across PCIe:
+      // separate runs 3809-3812 GPU -7..-8% (match, Bryan), command thread +10..15% (the CPU writes them across PCIe).
+      // Integrated GPUs share memory: no change there. Takes effect at start (a restart setting).
+      {"vulkan_uniform_pool_device_local", "true"},
+      {"vulkan_device_local_upload_min_heap_mb", "128"},
+      // Session 54 (part B): on a card without fragment shader interlock (the host render target path) the truth
+      // frames run too (no effect on cards with interlock). Forced fbo on the 4090: resolve hashes 467 / 467, parity
+      // shots 6 / 6 byte-identical to NATIVE on interlock; vs LIGHT GPU -13.3% match, command thread -4.7%.
+      {"gpu_native_truth_host_rt", "true"},
+      // Session 60 step 2: the crowd at the engine level - of each crowd group (audience_draw_block) the game records the
+      // first member only, the command processor adds the others as instances of that draw in one go (SDK
+      // gpu_scene_crowd_batch, on by default). Pictures 6 / 6 pixel-identical (4091 vs 4092); fast-forwarded normal
+      // play (4085 vs 4089): Brock's crowd opening shot 157 -> 240 fps (command thread -20%, draw packets 4,244 ->
+      // 1,257), Bryan's entrance +4% (pan +5%, command thread -10%), match +2%.
+      {"wwe2k14_scene_crowd", "1"},
+      // Session 66 (NATIVE 2, G2.1): a truth pass whose first draw clears the whole surface does not load what it
+      // clears (load op DONT_CARE: memory traffic on tile and bandwidth-poor GPUs; the 4090 is not bandwidth-bound).
+      // check_item g2_dont_care: pictures 6 / 6 pixel-identical (4173 / 4174), resolve hashes 467 / 467 (4172 / 4175),
+      // gameplay identical (4176 / 4177), no new validation-layer message (4183); in-run A/B (4178, 720p) GPU -0.6 /
+      // -1.2 / -2.0% (Brock / Bryan / match, within noise on the 4090).
+      {"gpu_native_truth_pass_dont_care", "true"},
+      // Session 73 (tile GPUs, Jarrod's item 5): ~10 of a match frame's 28 truth passes draw only depth into a real
+      // colour image, which was loaded and stored whole each time (validation best practices
+      // "redundant-attachment-on-tile"); they keep it with LOAD_OP_NONE / STORE_OP_NONE where the driver has
+      // VK_EXT_load_store_op_none (the Adreno 830 does). Same-frame replay byte-identical; no validation message.
+      {"gpu_native_truth_color_none", "true"},
+      // Session 66 (B2.1): the vertex fetch's endian swap fixed in the shader from the draw's fetch constants (the
+      // census: every draw 8-in-32, one key per shader, so no extra translations). check_item b2_endian: pictures 6 / 6
+      // pixel-identical (4180), hashes 467 / 467 (4179), gameplay identical (4181); A/B (4182) GPU -8.2 / +1.3 / -3.3%.
+      {"gpu_native_vertex_endian_spec", "true"},
+      // Session 66 (H1.1): resolve readbacks (the app's load windows, src/create_readback.h) batched - one GPU wait for
+      // many copies (~21-28 per wait, run 4193), flushed before any command-processor write the guest can observe.
+      // check_item h1_batch (after fix 01170fd): pictures 6 / 6 (4221 / 4223), hashes 467 / 467 (4220 / 4222),
+      // gameplay identical (4224 / 4225).
+      {"readback_resolve_batch", "true"},
+      // Session 66 (pixel shader specialisation): the texture fetch's sign / gamma handling fixed from the draw's fetch
+      // constants (one key per shader; NATIVE pixel shaders 1,695 -> 1,066 AMD instructions, RGA gfx1103). check_item
+      // ps_texspec: pictures 6 / 6, hashes 467 / 467, gameplay identical; A/B GPU -6.8% Brock, -8.2% Bryan.
+      {"gpu_native_ps_texture_spec", "true"},
+      // The Xenos multiply rule (0 x anything = 0) dropped in NATIVE pixel shaders only where both operands are proven
+      // finite (assumes finite interpolators, constants and texture results). check_item ps_mul1: pictures 6 / 6,
+      // hashes 467 / 467, gameplay identical.
+      // Session 66 (Jarrod 2026-10-26, after the review packs: "the images look good"): mode 2 (also dropped where not
+      // proven finite, with a NaN-to-0 fallback), implicit LOD and fused multiply-add are NATIVE defaults (looks right).
+      {"gpu_native_ps_mul_mode", "2"},
+      {"gpu_native_ps_implicit_lod", "true"},
+      {"gpu_native_fma", "3"},
+      // Session 66 (G1.1): a deferred texture-only resolve that a newer resolve into the same texture covers whole is
+      // dropped (nothing sampled it: the batch would have been flushed). check_item g1_drop: pictures 6 / 6, hashes
+      // 467 / 467, gameplay identical (4244-4249); A/B GPU -2.2 / +0.9 / -4.1% (Brock / Bryan / match).
+      {"gpu_native_truth_drop_dead_resolves", "1"},
+      // Session 66: the multiply rule in NATIVE's vertex shaders too (~40% of their instructions; -28% vertex work by
+      // RGA), dropped only where both operands are proven finite, fetched float vertex data counted as finite.
+      // check_item vs_mul1: pictures 6 / 6, hashes 467 / 467, gameplay identical (4251-4253).
+      {"gpu_native_vs_mul_mode", "1"},
+      {"gpu_native_vs_mul_fetch_finite", "true"},
+      // Session 66 (native_ext): NATIVE pixel shaders without the alpha test / alpha-to-coverage / exponent bias /
+      // gamma epilogue when the draw has none of them (~8% of pixel-shader work by RGA). check_item ps_epilogue: pictures
+      // 6 / 6, hashes 467 / 467, gameplay identical (4287-4292); A/B within noise on the 4090.
+      {"gpu_native_ps_epilogue_spec", "true"},
+      // Session 72 (Jarrod, 2026-10-28: "cheaper copy default"): the final post pass (match and entrance combines) runs
+      // our own shader in place of the game's translated one - a copy of it step for step by default (same frame 92-95%
+      // of pixels identical, the rest ~1 level; 1440p 4090: match 0.126 -> 0.078 ms, entrance 0.18-0.20 -> 0.08-0.11 ms,
+      // runs 4533 / 4534), Enhanced with post_effects 1 (GraphicsFlags). docs\systems\post_effects.md.
+      {"gpu_native_shader_swap", "true"},
+      // Session 72 part 4 (pass / copy overhead, Jarrod at work: "keep working on it"): the colour + depth restore that
+      // follows the scene's own two resolves in entrances (src\post_swap.h kRestoreColorDepth) is left out when the
+      // truth images still hold those pixels - before its textures are requested. Bryan's entrance at 1440p: 2 of its 3
+      // restores a frame (two full-screen colour + depth writes, two 14.7 MB depth texture reloads); Brock's: 1.
+      // check_item skip_restores_early_1440 / skip_restores_720: pictures 6 / 6, hashes 467 / 467 (4584-4587, 4579-4582).
+      {"gpu_native_truth_skip_restores", "true"},
+      // Session 72 part 4: a direct copy repeated with every register the same from an image nothing drew into since
+      // records no GPU work (1-2 a frame in Brock's entrance once its restore is left out). check_item skip_repeat_1440
+      // / _720: pictures 6 / 6, hashes 467 / 467 (4590-4597); pass-log A/B 4598: Brock -3.4%.
+      {"gpu_native_truth_skip_repeat_resolves", "true"},
+      // Session 80 (Jarrod, 2026-11-01: "yes on fill safety"): a batched texture fill (Session 52 / 59) that reads a
+      // renamed image outside its rename rectangle is not deferred - a rare-ordering gap the Session 79 review found
+      // (stale pixels possible). Only adds a flush in that ordering; under the arc switch: shots 4 / 4, 500 / 500
+      // resolve hashes, both replays MATCH (5174-5178).
+      {"gpu_native_truth_fill_rename_check", "true"},
+      // Session 80 look lever (Jarrod, 2026-11-01, the review sheets: "I can barely tell the difference", for
+      // everyone): a thinner distant crowd - of each crowd run's members farther than the median view depth of the
+      // run's members in front of the camera, every other one (by a position hash) not drawn; Session 90 (Jarrod:
+      // "stable as is"): +-8% hysteresis per member (SDK gpu_scene_crowd_thin_stable, default on), so the same members
+      // stay thinned from frame to frame - a member still switches once when the camera carries it across the line;
+      // ~15-20% of the queued members. It needs Session 70's exact crowd cull (members entirely outside the draw's own
+      // view not drawn).
+      {"gpu_scene_crowd_cull", "2"},
+      {"gpu_scene_crowd_thin", "100"},
+      // Session 82 (Jarrod, 2026-11-03 ~09:55: "we should probably push these updates! The performance updates back it
+      // up"): the owned frame - every pass of the frame drawn into images of ours, the truth path only as a counted
+      // fallback (docs\native\OWNED_FRAME_DESIGN.md). Integration 16: the match 100% of passes owned at 720p and 1440p,
+      // shots identical / within tolerance, entrance pair PASS; Surface (048 vs 042): match 54.8 -> 60.0 fps average,
+      // 1% low 38.8 -> 50.0. Not on phones (wwe2k14_app.h: untested on Adreno).
+      {"gpu_native_owned_frame", "true"},
+  };
+}
+
+inline std::vector<std::pair<std::string, std::string>> GraphicsFlags(const Choice& choice, const std::string& dlss_dir,
+                                                                      int monitor_hz) {
+  std::vector<std::pair<std::string, std::string>> f;
+  Choice c = choice;
+  // Session 93 (the LOW tier, flags only; STANDARD = the flags exactly as before): NATIVE only, not with the original look.
+  // Session 95 (Jarrod, 2026-11-06: "The individual settings take priority but yes they start with our safe low defaults"):
+  // the tier no longer overrides a setting the player can see. Its resolution (720p instead of 1440p) and crowd (70%) are
+  // STARTING VALUES the launcher writes into the settings (LowStartValues: first-run auto-detect, or picking LOW); what the
+  // file says is what runs. What LOW still does by itself is internal, with no setting of its own:
+  //  - the picture shown at the window's size by the presenter's SGSR when the scene is drawn below it (present_effect=sgsr:
+  //    our own shader, Vulkan, any GPU; FSR 1 would need the FidelityFX build flag REXGLUE_ENABLE_FIDELITYFX, off in the
+  //    PC SDK build: there present_effect only allows bilinear and sgsr);
+  //  - the shadow levers (below).
+  // Not in LOW (unchanged): gpu_native_owned_post_half (S82 look lever, judged by eye, -1.0 ms; its half-size passes are refused by copies and
+  // re-use paths and were never checked since the owned-only latch of Session 92). The shadow levers (gpu_shadow_half_rate,
+  // gpu_native_owned_shadow_half, gpu_native_owned_shadow_skip) are in LOW (Jarrod judged the sheets 2026-11-06: "completely fine") (Session 95, item K; below).
+  const bool low_tier = c.low && c.renderer == 2 && !c.original_look;
+  const bool low_scaled = low_tier && c.upscale == 0;
+  // Session 95 (item K): half-rate wrestler maps (gpu_shadow_half_rate), the 8-bit maps at 256 (S82, -0.8 ms),
+  // and the dependent passes skipped on the frames every map is skipped (gpu_native_owned_shadow_skip). Not with shadows off.
+  // Session 102 (Jarrod 2026-11-14 19:5x: "I've seen the half rate shadows, they're very difficult to notice, I'd be willing to simply have these
+  // be a default for everyone, not just LOW"): the half-rate wrestler maps (the new renderer reads gpu_shadow_half_rate) for EVERY tier with shadows on.
+  if (c.shadows && c.renderer == 2 && c.true_native) f.push_back({"gpu_shadow_half_rate", "true"});
+  if (low_tier && c.shadows && c.renderer == 2 && c.true_native) {  // (the typed cut is TRUE NATIVE's; the flags do nothing without it)
+    f.push_back({"gpu_native_owned_shadow_half", "true"});
+    f.push_back({"gpu_native_owned_shadow_skip", "true"});
+    // Session 95 (Jarrod judged the clips: "Half rate looks good"): the wrestlers' rim-light map, one frame behind the wrestler.
+    f.push_back({"gpu_native_owned_ring_half", "true"});
+  }
+  // Session 95 (resolves, LOW only, TRUE NATIVE's typed cut): the entrance's repeated small passes at half rate - the 20 crowd pose renders (64x64, ps
+  // ED94EC2F / 803205E3; the cards sample last frame's pose pages on the odd frames) and the 5 light-cube strip passes (384x64, 6 copies each; the cubes keep
+  // last frame's faces on the skipped frames). Not tied to the shadows setting. Picture-changing by one frame of age: shot-checker on the sheets.
+  if (low_tier && c.renderer == 2 && c.true_native) {
+    // Jarrod judged the clips: "Half rate looks good".
+    f.push_back({"gpu_native_crowd_pose_half", "true"});
+    f.push_back({"gpu_native_owned_strip_half", "true"});
+    // Session 95 (round 7): one phase for the half-rate passes (same cadence Jarrod approved, only the phase moves). Not run yet: the round 7 milestone's low stage.
+    f.push_back({"gpu_native_half_phase", "true"});
+  }
+  // An upscaler that picks the render and output size itself (DLSS, FSR quality / performance); DLAA and FSR native
+  // anti-alias at the chosen resolution.
+  // (Review fix: `dlss` is DLSS only; the FSR modes have their own block below.)
+  const bool dlss = c.upscale >= 2 && c.upscale <= 4;
+  const bool own_size = dlss || c.upscale == 6 || c.upscale == 7;
+  // Session 95 (Jarrod: "Original look doesn't need MSAA"): under the one renderer MSAA draws have no path (the picture froze in matches), so the look is 720p / 30 fps entrances without MSAA.
+  if (c.original_look) {
+    f.push_back({"wwe2k14_preset_1440p60", "false"});
+    f.push_back({"wwe2k14_force_no_msaa", "true"});
+  }
+  else if (!own_size && c.resolution == 0) f.push_back({"resolution_scale", "1"});
+  else if (!own_size && c.resolution == 2) f.push_back({"wwe2k14_preset_4k60", "true"});
+  // Session 95: 1440p is no longer the file's default, so it is asked for (the game's own preset, which is also its compiled-in
+  // default: a no-op where it is already on, and what makes 1440p true after a 720p start).
+  else if (!own_size && c.resolution == 1) f.push_back({"wwe2k14_preset_1440p60", "true"});
+  if ((c.frame_rate == 0 || c.frame_rate == 3) && !c.original_look) f.push_back({"wwe2k14_entrance_60fps", "false"});
+  // Session 37: 30 everywhere for weak PCs (below 60 the game runs in slow motion: it steps a fixed 1/60 s). Matches
+  // use the game's own 30 fps mode (step 1/30 s, run 2632: 33.3 ms frames, real time); entrances keep their stock 30
+  // (their rate 60 = unchanged). The match clock counts updates, so it runs at 30 per second (frame-counted timers at
+  // half rate: Jarrod to judge).
+  if (c.frame_rate == 3) {
+    f.push_back({"wwe2k14_step_hz", "30"});
+    f.push_back({"wwe2k14_step_hz_entrance", "60"});
+    // Session 41 (low-spec step 1, as --wwe2k14_preset_low): laptops, a shorter final spin before each vblank.
+    f.push_back({"gpu_vblank_precise_timer_spin_us", "250"});
+    // Session 44 (Jarrod, 2026-10-21, as --wwe2k14_preset_low): direct 1x texture loads for resolve outputs, exact,
+    // less GPU time on both renderers (NATIVE and LIGHT); no effect above 720p (scaled textures have their own setting).
+    f.push_back({"vulkan_texture_load_direct_unscaled", "true"});
+  }
+  const int hz = c.refresh_hz > 0 ? c.refresh_hz : monitor_hz;
+  const char* decouple_120 = std::getenv("WWE2K14_DECOUPLE_120");  // Session 95 (F6): the launcher-side switch (default off)
+  // (Session 95: only with TRUE NATIVE on the NATIVE renderer and no DLSS - the decoupled picture is made by the owned passes, and DLSS refuses the two-step present)
+  if (c.frame_rate == 2 && hz > 60 && decouple_120 && decouple_120[0] == '1' && c.true_native && c.renderer == 2 && !dlss) {
+    // 120 pictures a second at logic 60 (gpu_d3d_decouple phase 2): in place of step_hz / step_hz_entrance / step_vblank; a 165 Hz screen drops to 120 in this mode
+    f.push_back({"gpu_d3d_decouple", "9"});
+    f.push_back({"gpu_d3d_decouple_word", "0"});
+    f.push_back({"vulkan_allow_present_mode_immediate", "false"});  // mailbox: every frame shown, no tearing
+  } else if (c.frame_rate == 2 && hz > 60) {  // game steps per second = the refresh rate; entrances at most 120
+    f.push_back({"wwe2k14_step_hz", std::to_string(hz)});
+    f.push_back({"wwe2k14_step_hz_entrance", std::to_string(std::min(hz, 120))});
+    f.push_back({"wwe2k14_step_vblank", "true"});
+    f.push_back({"vulkan_allow_present_mode_immediate", "false"});  // mailbox: every frame shown, no tearing
+  }
+  if (c.upscale == 1) f.push_back({"wwe2k14_dlaa", "true"});
+  if (dlss) {
+    static const char* modes[] = {"performance", "quality", "ultra_performance"};
+    f.push_back({"wwe2k14_dlss", "true"});
+    f.push_back({"wwe2k14_dlss_mode", modes[c.upscale - 2]});
+  }
+  if (c.texture_filter == 1 || c.texture_filter == 2)  // Session 33: anisotropic filtering 8x / 16x
+    f.push_back({"wwe2k14_texture_filter", c.texture_filter == 2 ? "16" : "8"});
+  if (IsFsr(c.upscale)) {  // Session 33
+    static const char* modes[] = {"native", "quality", "performance"};
+    f.push_back({"wwe2k14_fsr", "true"});
+    f.push_back({"wwe2k14_fsr_mode", modes[c.upscale - 5]});
+  }
+  if (c.renderer == 1) f.push_back({"wwe2k14_light_renderer", "true"});  // Session 37
+  if (c.renderer == 2)
+    for (const auto& [name, value] : NativeRendererFlags()) f.push_back({name, value});
+  // Session 72's Enhanced post effects: removed (Session 100, Jarrod 2026-11-11 08:1x: "we should simply remove those"); post_effects is
+  // still read from older files and ignored.
+  // Session 85 (Jarrod): shadows / depth of field / crowd density, NATIVE only, flags only when not the default.
+  if (c.renderer == 2) {
+    if (!c.shadows) f.push_back({"gpu_dynamic_shadows", "false"});
+    if (!c.depth_of_field) f.push_back({"gpu_depth_of_field", "false"});
+    const int crowd = RoundCrowdDensity(c.crowd_density);
+    if (crowd < 100) f.push_back({"gpu_scene_crowd_density", std::to_string(crowd)});
+  }
+  // Session 100 settings parity (the new renderer reads them; flags only when not the default): S3 FILM GRAIN (30 YEARS), S13 V-SYNC
+  // (present only: the old renderer keeps its own present modes, tearing allowed at 60, mailbox at 120).
+  if (!c.film_grain) f.push_back({"wwe2k14_film_grain", "false"});
+  if (!c.vsync) f.push_back({"wwe2k14_vsync", "false"});
+  // Session 93: LOW shows the picture through SGSR (the phone's setting too), whatever size it is drawn at.
+  // (Session 95: the presenter only uses SGSR when the frontbuffer is smaller than the window, so this is a no-op at 1440p / 4K.)
+  if (low_scaled) f.push_back({"present_effect", "sgsr"});
+  // Session 87 (Jarrod: "true native"): the game's Direct3D calls to our own renderer, the whole stack in one switch.
+  if (c.renderer == 2 && c.true_native) f.push_back({"wwe2k14_d3d_owned", "true"});
+  if (c.display_720p) f.push_back({"wwe2k14_display_720p", "true"});  // Session 95 (off by default; fullscreen only, the game checks)
+  // Session 54: NATIVE drawing below the whole size (no upscaler: DLAA / DLSS / FSR turn truth frames off; the SDK
+  // logs and ignores a height it cannot draw).
+  if (c.renderer == 2 && c.upscale == 0 && !c.original_look && ValidDrawHeight(c.resolution, c.draw_height))
+    f.push_back({"gpu_native_truth_draw_height", std::to_string(c.draw_height)});
+  // Wrestler motion vectors are always on with DLAA / DLSS / FSR (Session 28: the game's own default, no flag needed).
+  if (IsNvidia(c.upscale) && !dlss_dir.empty()) f.push_back({"wwe2k14_dlaa_dir", dlss_dir});
+  return f;
+}
+
+}  // namespace wwe2k14::gfxs

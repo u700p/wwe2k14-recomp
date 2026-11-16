@@ -1,0 +1,180 @@
+# Package the Android APK (ANDROID_PLAN.md step 4.3): our Java + SDL's Java (javac -> d8), the manifest (aapt2), the
+# native libraries (stripped of debug info), zipalign, apksigner with the debug key. No Gradle. Holds the run lock.
+#   pwsh -File tools\android\build_apk.ps1              -> out\android\apk\wwe2k14-android-dev.apk
+#   pwsh -File tools\android\build_apk.ps1 -Install     ... then adb install -r on the connected phone
+# Inputs: out\android\sdk-install-arm64\lib (build_sdk_android.ps1), out\android\game-arm64\libmain.so
+# (build_game_android.ps1), out\android\launcher-arm64\liblauncher.so + libviewer.so (build_launcher.ps1 -Target android, Session 71;
+# the Arena Viewer since Session 98).
+# Never game files: only our code, the recompiled code and shader_list.txt (CLAUDE.md rule 1), plus Jarrod's own logo
+# trace (assets\launcher\wwe2k14_logo.png, the launcher's) and the app icon made from game_logo.png (the fan-made
+# SteamGridDB icon the PC exe uses; F13, Jarrod 2026-10-28).
+# The debug key lives outside the repo (%USERPROFILE%\.android\wwe2k14-debug.jks), made once with keytool; its password
+# is Android's usual debug-key "android" (a development key: release signing is ANDROID_PLAN 9.3).
+# Session 95: versionCode and versionName come from android\VERSION (android-vMAJOR.MINOR.PATCH: major*10000 + minor*100 + patch).
+# tools\android\signing_fingerprint.txt holds the key's SHA-256: an APK signed with another key cannot update an installed game,
+# and a player's only way out is to uninstall, which deletes the saves. With a fingerprint on file a missing key is never remade.
+# The finished APK goes through tools\android\check_apk.py.
+#   -Release (lane 280): a release APK. Implies -NoDebuggable and refuses (exit 2) unless the Android SDK install (outndroid\sdk-install-arm64\sdk_commit.txt,
+#   stamped by build_sdk_android.ps1) was built from the SDK commit of the PC pin (tools\sdk_pins.json, last entry) with no tracked edits.
+param([switch]$Install, [switch]$NoDebuggable, [switch]$BundleDrivers, [switch]$Release)
+. "$PSScriptRoot\env.ps1"
+$ErrorActionPreference = 'Stop'
+if ($Release) {
+    $NoDebuggable = [switch]$true
+    $pins = (Get-Content "$PSScriptRoot\..\sdk_pins.json" -Raw | ConvertFrom-Json).pins
+    $pinCommit = $pins[-1].sdk_commit
+    $stampFile = "$($AndroidDirs.SdkInstall)\sdk_commit.txt"
+    if (-not (Test-Path $stampFile)) {
+        "build_apk.ps1 -Release: no $stampFile (the Android SDK install predates the stamp). Rebuild: pwsh -File toolsndroiduild_sdk_android.ps1 -Run NAME [-AllowBranch wwe2k14-local]; the PC pin is $($pins[-1].id) = $pinCommit"; exit 2
+    }
+    $stamp = @{}; Get-Content $stampFile | ForEach-Object { if ($_ -match '^(\w+)=(.*)$') { $stamp[$Matches[1]] = $Matches[2] } }
+    if ($stamp['commit'] -ne $pinCommit) {
+        "build_apk.ps1 -Release: the Android SDK install was built from $($stamp['commit']), the PC pin $($pins[-1].id) is $pinCommit. Rebuild the Android SDK from the pinned commit (build_sdk_android.ps1) and the game library (build_all.ps1)."; exit 2
+    }
+    if ([int]$stamp['dirty_tracked_files'] -ne 0) {
+        "build_apk.ps1 -Release: the Android SDK install was built with $($stamp['dirty_tracked_files']) uncommitted tracked edits in the SDK checkout; rebuild from a clean tree."; exit 2
+    }
+    "release pin check: Android SDK install = $pinCommit (pin $($pins[-1].id)), clean"
+}
+. "$ProjectRoot\tools\runlock.ps1"
+
+# Session 98 (phone port stage C): in a git worktree (.claude\worktrees\<name>: no thirdparty folder, no SDK / game build) the inputs
+# other than this worktree's own launcher + viewer come from the main checkout (its thirdparty and out\android).
+$deps = $ProjectRoot
+if (-not (Test-Path "$ProjectRoot\thirdparty\rexglue-sdk-src") -and (Test-Path "$ProjectRoot\..\..\..\thirdparty\rexglue-sdk-src")) {
+    $deps = (Resolve-Path "$ProjectRoot\..\..\..").Path
+}
+function In([string]$p) { if ((Test-Path $p) -or $deps -eq $ProjectRoot) { $p } else { $p.Replace($AndroidOut, "$deps\out\android") } }
+$sdl = "$deps\thirdparty\rexglue-sdk-src\thirdparty\sdl3\android-project\app\src\main\java"
+$ours = "$ProjectRoot\android\java"
+$manifest = "$ProjectRoot\android\AndroidManifest.xml"
+$obj = "$AndroidOut\apk-obj"
+$apk = "$($AndroidDirs.Apk)\wwe2k14-android-dev.apk"
+$keystore = "$env:USERPROFILE\.android\wwe2k14-debug.jks"
+$fingerprintFile = "$ProjectRoot\tools\android\signing_fingerprint.txt"
+# Session 95: the same sum as check_apk.py. 18 was the last hand-set code; a lower one fails to install as an update.
+$versionName = (Get-Content "$ProjectRoot\android\VERSION" -TotalCount 1).Trim()
+if ($versionName -notmatch '^android-v(\d+)\.(\d+)\.(\d+)$' -or [int]$Matches[2] -gt 99 -or [int]$Matches[3] -gt 99) {
+    "build_apk.ps1: android\VERSION is not android-vMAJOR.MINOR.PATCH with minor and patch under 100: '$versionName'"; exit 2
+}
+$versionCode = [int]$Matches[1] * 10000 + [int]$Matches[2] * 100 + [int]$Matches[3]
+if ($versionCode -le 18) { "build_apk.ps1: versionCode $versionCode from android\VERSION is not above 18"; exit 2 }
+$libs = [ordered]@{
+    'libc++_shared.so'   = "$Llvm\..\sysroot\usr\lib\aarch64-linux-android\libc++_shared.so"
+    'librexruntime.so'   = (In "$($AndroidDirs.SdkInstall)\lib\librexruntime.so")
+    'librexgpu-xenos.so' = (In "$($AndroidDirs.SdkInstall)\lib\librexgpu-xenos.so")
+    'libmain.so'         = (In "$($AndroidDirs.Game)\libmain.so")
+    'liblauncher.so'     = "$AndroidOut\launcher-arm64\liblauncher.so"
+    # Session 98 (Arena Viewer phone port, stage C): ViewerActivity's library, built with the launcher (build_launcher.ps1 -Target android).
+    'libviewer.so'       = "$AndroidOut\launcher-arm64\libviewer.so"
+    # Session 72 (Android drivers, src\android_driver.h): libadrenotools' hook libraries, built with the game.
+    'libhook_impl.so'    = (In "$($AndroidDirs.Game)\adrenotools\src\hook\libhook_impl.so")
+    'libmain_hook.so'    = (In "$($AndroidDirs.Game)\adrenotools\src\hook\libmain_hook.so")
+}
+foreach ($k in $libs.Keys) { if (-not (Test-Path $libs[$k])) { "build_apk.ps1: missing $k ($($libs[$k]))"; exit 2 } }
+# Session 72: the custom Vulkan drivers built from source (tools\android\drivers\build_drivers.ps1); optional.
+# S101 (Jarrod, 2026-11-13: "packaging the drivers doesn't seem to fix things really"): NOT packaged unless -BundleDrivers.
+# The phone's own driver is the default; a player can still import their own (launcher, src\android_driver.h), and the
+# libadrenotools hook libraries above stay for that. A saved setting naming a bundled driver falls back to the phone's.
+foreach ($d in @(if ($BundleDrivers) { Get-ChildItem (In "$AndroidOut\drivers") -Filter 'libvulkan_*.so' -ErrorAction SilentlyContinue })) {
+    $libs[$d.Name] = $d.FullName
+}
+
+function Run([string]$What, [scriptblock]$Cmd) {
+    $out = & $Cmd 2>&1
+    if ($LASTEXITCODE -ne 0) { "build_apk.ps1: $What failed (exit $LASTEXITCODE)"; $out | Select-Object -Last 30; exit 1 }
+}
+
+$lock = Enter-RunLock -Name "build_apk.ps1"
+try {
+$t0 = Get-Date
+if (Test-Path $obj) { Remove-Item $obj -Recurse -Force }
+foreach ($d in 'classes', 'dex', 'zip\lib\arm64-v8a', 'assets', 'res') { [void](New-Item -ItemType Directory -Force "$obj\$d") }
+
+# 1. Java -> classes -> dex
+$sources = @(Get-ChildItem $sdl, $ours -Recurse -Filter *.java | ForEach-Object FullName)
+$sources | Set-Content "$obj\sources.txt" -Encoding ascii
+Run 'javac' { & "$Jdk\bin\javac.exe" --release 11 -encoding UTF-8 -nowarn -classpath $AndroidJar -d "$obj\classes" "@$obj\sources.txt" }
+Run 'jar' { & "$Jdk\bin\jar.exe" cf "$obj\classes.jar" -C "$obj\classes" . }
+Run 'd8' { & "$BuildTools\d8.bat" --release --min-api $MinApi --lib $AndroidJar --output "$obj\dex" "$obj\classes.jar" }
+
+# 2. Manifest (+ assets, + the icon) -> base APK
+if (Test-Path "$ProjectRoot\db\shaders\shader_list.txt") { Copy-Item "$ProjectRoot\db\shaders\shader_list.txt" "$obj\assets\" }
+Copy-Item "$ProjectRoot\assets\launcher\wwe2k14_logo.png" "$obj\assets\"  # the launcher's logo (SDL reads assets)
+# Session 72: the notices, with the licence texts of the bundled drivers and their loader. Flat in assets/: aapt2 on
+# Windows keeps a subfolder's backslash in the entry name.
+Copy-Item "$ProjectRoot\docs\release\THIRD_PARTY_NOTICES.md" "$obj\assets\"
+$licences = @(@{ n = 'LICENSE_libadrenotools.txt'; p = "$deps\thirdparty\libadrenotools\LICENSE" })
+if ($BundleDrivers) { $licences += @(@{ n = 'LICENSE_mesa.txt'; p = "$deps\thirdparty\mesa\docs\license.rst" }, @{ n = 'LICENSE_mali-panvk.txt'; p = "$deps\thirdparty\mali-panvk\LICENSE" }) }
+# L310: the drivers' notices travel only with the drivers (THIRD_PARTY_NOTICES.md says so in its Android section).
+if ($BundleDrivers) { Copy-Item "$ProjectRoot\docs\release\THIRD_PARTY_NOTICES_DRIVERS.md" "$obj\assets\" }
+foreach ($l in $licences) {
+    if (Test-Path $l.p) { Copy-Item $l.p "$obj\assets\$($l.n)" }
+}
+# The launcher icon in Android's five densities, from game_logo.png (512 x 512).
+Add-Type -AssemblyName System.Drawing
+$icon = [System.Drawing.Image]::FromFile("$ProjectRoot\game_logo.png")
+try {
+    foreach ($d in @(@('mdpi', 48), @('hdpi', 72), @('xhdpi', 96), @('xxhdpi', 144), @('xxxhdpi', 192))) {
+        [void](New-Item -ItemType Directory -Force "$obj\res\mipmap-$($d[0])")
+        $bmp = [System.Drawing.Bitmap]::new($d[1], $d[1])
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $g.DrawImage($icon, 0, 0, $d[1], $d[1])
+        $g.Dispose()
+        $bmp.Save("$obj\res\mipmap-$($d[0])\ic_launcher.png", [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+    }
+} finally { $icon.Dispose() }
+Run 'aapt2 compile' { & "$BuildTools\aapt2.exe" compile --dir "$obj\res" -o "$obj\res.zip" }
+$aaptArgs = @('link', '--manifest', $manifest, '-I', $AndroidJar, '--min-sdk-version', "$MinApi",
+              '--target-sdk-version', "$ApiLevel", '--version-code', "$versionCode", '--version-name', $versionName,
+              '-A', "$obj\assets", '-R', "$obj\res.zip", '--auto-add-overlay',
+              '-o', "$obj\base.apk")
+if (-not $NoDebuggable) { $aaptArgs += '--debug-mode' }
+Run 'aapt2 link' { & "$BuildTools\aapt2.exe" @aaptArgs }
+
+# 3. classes.dex + the native libraries (debug info stripped; the unstripped copies stay in out\android\symbols)
+Copy-Item "$obj\dex\classes.dex" "$obj\zip\classes.dex"
+foreach ($k in $libs.Keys) {
+    Run "llvm-strip $k" { & "$Llvm\llvm-strip.exe" --strip-debug -o "$obj\zip\lib\arm64-v8a\$k" $libs[$k] }
+}
+Copy-Item $libs['librexruntime.so'], $libs['librexgpu-xenos.so'] $AndroidDirs.Symbols -Force
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+$zip = [System.IO.Compression.ZipFile]::Open("$obj\base.apk", [System.IO.Compression.ZipArchiveMode]::Update)
+try {
+    foreach ($f in Get-ChildItem "$obj\zip" -Recurse -File) {
+        $name = $f.FullName.Substring("$obj\zip\".Length).Replace('\', '/')
+        [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $f.FullName, $name,
+            [System.IO.Compression.CompressionLevel]::Optimal)
+    }
+} finally { $zip.Dispose() }
+
+# 4. Align (16 KB for .so files) and sign
+Run 'zipalign' { & "$BuildTools\zipalign.exe" -f -P 16 4 "$obj\base.apk" "$obj\aligned.apk" }
+# Session 73: every library's LOAD segments 16 KB-aligned (phones with 16 KB pages refuse to load the rest).
+Run '16 KB alignment' { & py "$ProjectRoot\tools\android\check_page_align.py" "$obj\aligned.apk" --expect @($libs.Keys) }
+if (-not (Test-Path $keystore)) {
+    if ((Test-Path $fingerprintFile) -and (Select-String -Path $fingerprintFile -Pattern '^[0-9a-fA-F]{64}\s*$' -Quiet)) {
+        "build_apk.ps1: the signing key $keystore is missing and $fingerprintFile names one. Refusing to make a new key: restore the backup."
+        exit 1
+    }
+    [void](New-Item -ItemType Directory -Force (Split-Path $keystore))
+    Run 'keytool' { & "$Jdk\bin\keytool.exe" -genkeypair -keystore $keystore -storepass android -keypass android `
+        -alias wwe2k14-debug -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=wwe2k14 debug, O=wwe2k14-recomp" }
+    "created the debug key $keystore"
+}
+Run 'apksigner' { & "$BuildTools\apksigner.bat" sign --ks $keystore --ks-pass pass:android --ks-key-alias wwe2k14-debug `
+    --out $apk "$obj\aligned.apk" }
+# Session 95: the manifest's flags, the version and the key's fingerprint, read back from the APK (prints the SHA-256).
+& py "$ProjectRoot\tools\android\check_apk.py" $apk --build-tools $BuildTools
+if ($LASTEXITCODE -ne 0) { "build_apk.ps1: the APK check failed (exit $LASTEXITCODE)"; exit 1 }
+"apk: {0:N1} MB  {1}  ({2} s)" -f ((Get-Item $apk).Length / 1MB), $apk, [int]((Get-Date) - $t0).TotalSeconds
+} finally { Exit-RunLock $lock }
+
+if ($Install) {
+    "installing on the phone (confirm on the phone if ColorOS asks)..."
+    & $Adb install -r $apk
+    exit $LASTEXITCODE
+}

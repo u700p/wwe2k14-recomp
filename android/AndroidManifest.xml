@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- wwe2k14 Android port (Session 63, ANDROID_PLAN.md 4.1; Session 71: the launcher). Package: Jarrod's Q1 answer
+     (2026-10-25, permanent). Built by tools/android/build_apk.ps1 (no Gradle). android:debuggable is set in development
+     builds only: the build script adds it (run-as, lldb and simpleperf need it).
+     Session 71: LauncherActivity (src/launcher_mobile, liblauncher.so) is the app's entry point and turns with the
+     phone; GameActivity runs the game in its own process (":game"), landscape. Name and icon: F13 ("WWE 2K14 +
+     game_logo.png"). INTERNET: the launcher's update check only (GitHub's latest-release address).
+     Session 95: versionCode and versionName come from android/VERSION (build_apk.ps1); tools/android/check_apk.py checks the
+     built APK. configChanges lists every change a running game must survive: SDL cannot rebuild an activity under a game. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.github.jarrodfeng.wwe2k14"
+    android:installLocation="auto">
+
+    <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="36" />
+
+    <!-- Vulkan 1.2 (0x402000); optional so the store / installer does not filter by it. -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x402000" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <!-- Rumble on the phone (ANDROID_PLAN F2) and the touch controls' vibrate-on-press (F1). -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Session 81: the launcher's self-update hands the downloaded APK to Android's installer (the player still taps
+         Install; the first time they allow installs from this app). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Session 98: BUILD TRON PREVIEWS keeps going in the background (TronExportService, a foreground service in the game's
+         process: mediaProcessing on Android 15+, dataSync before). S101 (2026-11-13, Jarrod: phones flag the notification
+         permission as sensitive; not worth it for building tron preview caches): no POST_NOTIFICATIONS, never asked for, no
+         result notification; the progress is the bar on the game's screen. The service's own foreground notification needs no
+         permission (Android hides it without one). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
+
+    <application
+        android:label="WWE 2K14"
+        android:icon="@mipmap/ic_launcher"
+        android:isGame="true"
+        android:appCategory="game"
+        android:extractNativeLibs="true"
+        android:hasCode="true"
+        android:allowBackup="false"
+        android:hasFragileUserData="true"
+        android:enableOnBackInvokedCallback="true"
+        android:hardwareAccelerated="true">
+
+        <activity
+            android:name=".LauncherActivity"
+            android:exported="true"
+            android:label="WWE 2K14"
+            android:screenOrientation="fullUser"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.NoTitleBar"
+            android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation|density|colorMode|fontWeightAdjustment|grammaticalGender|mcc|mnc|touchscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Exported for the phone test harness (tools/android/run.ps1 starts it with adb). -->
+        <activity
+            android:name=".GameActivity"
+            android:process=":game"
+            android:exported="true"
+            android:label="WWE 2K14"
+            android:screenOrientation="sensorLandscape"
+            android:launchMode="singleTask"
+            android:preferMinimalPostProcessing="true"
+            android:resizeableActivity="false"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation|density|colorMode|fontWeightAdjustment|grammaticalGender|mcc|mnc|touchscreen" />
+
+        <!-- Session 98 (Arena Viewer phone port, stage C): the Arena Viewer (libviewer.so), its own process, landscape; started by the
+             launcher's MODS page. Exported for the phone test harness (tools/android/run.ps1 -Viewer starts it with adb). -->
+        <activity
+            android:name=".ViewerActivity"
+            android:process=":viewer"
+            android:exported="true"
+            android:label="WWE 2K14"
+            android:screenOrientation="sensorLandscape"
+            android:launchMode="singleTask"
+            android:resizeableActivity="false"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation|density|colorMode|fontWeightAdjustment|grammaticalGender|mcc|mnc|touchscreen" />
+
+        <!-- Session 74: the launcher's MOVE THE CONTROLS screen (the touch controls' edit mode), the launcher's process. -->
+        <activity
+            android:name=".TouchEditActivity"
+            android:exported="false"
+            android:label="WWE 2K14"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation|density|colorMode|fontWeightAdjustment|grammaticalGender|mcc|mnc|touchscreen" />
+
+        <!-- Session 98: the tron export's foreground service (see the permissions above), in the game's process. -->
+        <service
+            android:name=".TronExportService"
+            android:process=":game"
+            android:exported="false"
+            android:foregroundServiceType="dataSync|mediaProcessing" />
+
+        <provider
+            android:name=".FileShareProvider"
+            android:authorities="io.github.jarrodfeng.wwe2k14.files"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+    </application>
+</manifest>

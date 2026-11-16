@@ -1,0 +1,224 @@
+// wwe2k14 phone launcher - the PC test build's platform (Session 71). The launcher runs in a phone-shaped window; what
+// only a phone can do (the share sheet, save export) says so instead, and PLAY writes the game's command line to
+// <files>/last_launch.txt rather than starting anything, so a test can read what the phone's game would get.
+//   --files DIR       the app folder stand-in (default: out\launcher_mobile\files next to the build)
+//   --screen WxH      the phone's screen for "fill the screen" (default 3168x1440, Jarrod's Find X8 Ultra)
+#include "../thread_name.h"  // S102 H1
+#include <SDL3/SDL.h>
+
+#include <cstdlib>
+#include <fstream>
+#include <thread>
+
+#include "mobile_platform.h"
+
+namespace mlauncher::platform {
+
+namespace {
+fs::path g_files;
+int g_screen_w = 3168, g_screen_h = 1440;
+
+void Message(std::string text) {
+  Event e;
+  e.kind = Event::kMessage, e.a = std::move(text);
+  Post(std::move(e));
+}
+}  // namespace
+
+void Init(int argc, char** argv) {
+  for (int i = 1; i + 1 < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--files") g_files = fs::u8path(argv[++i]);
+    else if (a == "--screen") std::sscanf(argv[++i], "%dx%d", &g_screen_w, &g_screen_h);
+  }
+  if (g_files.empty()) g_files = fs::u8path(SDL_GetBasePath()) / "files";
+  std::error_code ec;
+  fs::create_directories(g_files, ec);
+}
+
+fs::path FilesDir() { return g_files; }
+const char* Name() { return "desktop"; }
+
+std::string DeviceKey() { return "desktop"; }
+fs::path NativeLibDir() { return {}; }
+fs::path DriversDir() { return g_files / "drivers"; }
+void ImportDriver(const fs::path&) {
+  Message("PC test build: driver import works on the phone only (put a folder with wwe2k14_driver.json in files/drivers)");
+}
+
+void PickGameFile() {
+  static const SDL_DialogFileFilter filters[] = {{"Xbox 360 disc image", "iso"}, {"Game executable", "xex"}};
+  SDL_ShowOpenFileDialog(
+      [](void*, const char* const* list, int) {
+        Event e;
+        e.kind = Event::kGamePicked;
+        e.ok = list && list[0];
+        if (e.ok) {
+          fs::path p = fs::u8path(list[0]);
+          if (p.extension() == ".xex") p = p.parent_path();  // an extracted folder: its default.xex
+          e.a = U8(p), e.b = U8(p.filename());
+        }
+        Post(std::move(e));
+      },
+      nullptr, nullptr, filters, 2, nullptr, false);
+}
+
+std::string OpenGameFile(const std::string& address) {
+  std::error_code ec;
+  return fs::exists(fs::u8path(address), ec) ? address : std::string();
+}
+
+// Session 98 (IMPORT TRON PREVIEWS): the zip read in place.
+void PickTronZip() {
+  static const SDL_DialogFileFilter filters[] = {{"Tron previews (zip)", "zip"}};
+  SDL_ShowOpenFileDialog(
+      [](void*, const char* const* list, int) {
+        if (!list || !list[0]) return;
+        Event e;
+        e.kind = Event::kTronZipPicked;
+        e.a = list[0], e.b = U8(fs::u8path(list[0]).filename());
+        Post(std::move(e));
+      },
+      nullptr, nullptr, filters, 1, nullptr, false);
+}
+std::string OpenPickedZip(const std::string& address) { return address; }
+void ClosePickedZip() {}
+
+// Lane 286 (custom music), the PC test build: the same copy as the phone's, from SDL's file dialog; the text box is a fixed answer.
+void PickAudio(const fs::path& dir, const std::string& stem) {
+  static fs::path d;
+  static std::string st;
+  d = dir, st = stem;
+  SDL_ShowOpenFileDialog(
+      [](void*, const char* const* list, int) {
+        if (!list || !list[0]) return;
+        std::vector<fs::path> files;
+        for (int i = 0; list[i]; ++i) files.push_back(fs::u8path(list[i]));
+        std::thread([files] { wwe2k14::NameThread(L"mob_plat_a");
+          std::error_code ec;
+          fs::create_directories(d, ec);
+          int copied = 0;
+          for (const auto& f : files) {
+            const bool keep_name = st.empty() || st[0] == '@';  // "@library" / "@new": several files keep their names; digits: one theme file
+            const fs::path dst = d / (keep_name ? f.filename() : fs::u8path(st) += f.extension());
+            if (fs::copy_file(f, dst, fs::copy_options::overwrite_existing, ec)) ++copied;
+          }
+          Event e;
+          e.kind = Event::kSongsAdded, e.ok = copied > 0, e.a = std::to_string(copied) + " song(s) added", e.b = st;  // (e.b = the purpose, as on the phone)
+          Post(std::move(e));
+        }).detach();
+      },
+      nullptr, nullptr, nullptr, 0, nullptr, stem.empty() || stem[0] == '@');
+}
+void PromptText(const std::string&, const std::string& initial, const std::string& tag) {
+  Event e;  // (the phone shows Android's text box; this build answers with "<text> 2" so the rename path can be exercised)
+  e.kind = Event::kTextEntered, e.a = initial + " 2", e.b = tag;
+  Post(std::move(e));
+}
+
+void AddDlc(const fs::path& dlc_dir) {
+  static fs::path dir;
+  dir = dlc_dir;
+  SDL_ShowOpenFileDialog(
+      [](void*, const char* const* list, int) {
+        if (!list || !list[0]) return;
+        std::vector<fs::path> files;
+        for (int i = 0; list[i]; ++i) files.push_back(fs::u8path(list[i]));
+        std::thread([files] { wwe2k14::NameThread(L"mob_plat_b");
+          std::error_code ec;
+          fs::create_directories(dir, ec);
+          int copied = 0;
+          for (const auto& f : files)
+            if (fs::copy_file(f, dir / f.filename(), fs::copy_options::overwrite_existing, ec)) ++copied;
+          Event e;
+          e.kind = Event::kDlcAdded, e.a = "Copied " + std::to_string(copied) + " of " + std::to_string(files.size()) + " files";
+          Post(std::move(e));
+        }).detach();
+      },
+      nullptr, nullptr, nullptr, 0, nullptr, true);
+}
+
+void Share(const std::vector<fs::path>& files) {
+  std::string text = "PC test build: the phone would share";
+  for (const auto& f : files) text += " " + U8(f.filename());
+  Message(text);
+}
+
+void ExportSaves(const fs::path&) { Message("PC test build: save export works on the phone only"); }
+void ImportSaves(const fs::path&) { Message("PC test build: save import works on the phone only"); }
+
+void CheckForUpdate(const std::string& version) {
+  std::thread([version] { wwe2k14::NameThread(L"mob_plat_c");
+    Event e;
+    e.kind = Event::kUpdate;
+    // Session 81 test: WWE2K14_UPDATE_FILE=release.json offers that release (an android-v... one with an .apk asset)
+    if (const char* f = std::getenv("WWE2K14_UPDATE_FILE")) {
+      std::ifstream in(f, std::ios::binary);
+      const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      const auto j = nlohmann::json::parse(body, nullptr, false);
+      launcher::UpdateInfo u;
+      if (j.is_object()) {
+        u.tag = j.value("tag_name", ""), u.name = j.value("name", ""), u.url = j.value("html_url", ""), u.notes = j.value("body", "");
+        launcher::PickAsset(j, "wwe2k14-android-", ".apk", u);
+        u.state = launcher::UpdateInfo::kAvailable;
+      } else {
+        u.state = launcher::UpdateInfo::kFailed, u.error = "test file unreadable";
+      }
+      e.update = u;
+    } else {
+      e.update = launcher::CheckForUpdate(version);
+    }
+    Post(std::move(e));
+  }).detach();
+}
+
+void OpenUrl(const std::string& url) { SDL_OpenURL(url.c_str()); }
+
+// Session 81: the PC test build only pretends (so the app's update screens can be looked at): a download that counts up,
+// and an install that says so. The phone's real one is LauncherActivity.jDownloadUpdate / jInstallUpdate.
+void DownloadUpdate(const std::string&, const std::string&) {
+  std::thread([] { wwe2k14::NameThread(L"mob_plat_d");
+    constexpr unsigned long long total = 60u << 20;
+    for (unsigned long long done = 0; done < total; done += 4u << 20) {
+      Event e;
+      e.kind = Event::kUpdateProgress, e.a = std::to_string(done) + " " + std::to_string(total);
+      Post(std::move(e));
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    Event e;
+    e.kind = Event::kUpdateDownloaded, e.ok = true;
+    Post(std::move(e));
+  }).detach();
+}
+void InstallUpdate() { Message("PC test build: the update installs on the phone only"); }
+void ClearUpdate() {}
+
+void StartGame(const std::vector<std::string>& args, const std::string& game_address, const TouchChoice& touch) {
+  std::ofstream f(g_files / "last_launch.txt", std::ios::trunc);
+  f << "# game: " << game_address << "\n# touch: mode " << touch.mode << " size " << touch.size << " opacity "
+    << touch.opacity << " vibrate " << touch.vibrate << "\n";
+  for (const auto& a : args) f << a << "\n";
+  Message("PC test build: the game's command line is in last_launch.txt");
+}
+
+void StartViewer(const std::vector<std::string>& args, const std::string& game_address) {
+  std::ofstream f(g_files / "last_viewer_launch.txt", std::ios::trunc);
+  f << "# game: " << game_address << "\n";
+  for (const auto& a : args) f << a << "\n";
+  Message("PC test build: the Arena Viewer opens on the phone; its command line is in last_viewer_launch.txt");
+}
+
+void EditTouchLayout(int, int) { Message("PC test build: moving the touch controls works on the phone only"); }
+
+bool GameAlive() { return false; }  // Session 98 (the PC test build starts no game process)
+void KillGame() {}
+
+void Quit() {
+  SDL_Event e{};
+  e.type = SDL_EVENT_QUIT;
+  SDL_PushEvent(&e);
+}
+
+void ScreenSize(int& w, int& h) { w = g_screen_w, h = g_screen_h; }
+
+}  // namespace mlauncher::platform

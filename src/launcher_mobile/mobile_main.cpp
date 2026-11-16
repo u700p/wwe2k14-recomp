@@ -1,0 +1,3794 @@
+// wwe2k14 phone launcher (Session 71, ANDROID_PLAN F4; Jarrod 2026-10-28: "Port the PC launcher", both
+// orientations as "enterable menus with a top left hamburger menu to get back").
+//
+// Dear ImGui on SDL3's renderer, in its own Android process (LauncherActivity); PLAY hands the game its command line
+// and closes the launcher (the game runs in a fresh process, GameActivity). The look is the PC launcher's (Session 31,
+// launcher_theme.h): the dotted dark background, the red band, slanted buttons, the game's menu font read from the
+// player's own files (game_font.h) and the logo traced by Jarrod. The same file builds as a Windows test program
+// (platform_desktop.cpp) so the pages can be checked in a phone-shaped window without a phone:
+//   wwe2k14_launcher_mobile.exe [--window WxH] [--scale S] [--files DIR] [--screen WxH]
+//                               [--page N] [--shot FILE.png] [--frames N] [--scroll PX] [--select N]
+//                               [--tap X,Y] [--quit-ms N] [--check] [--share-test] [--import-trons ZIP]
+// --shot draws --frames frames (default 4) of page N, saves the window as a PNG and quits (tools\android\
+// launcher_shots.ps1 uses it). --tap sends a touch tap at the 3rd frame, --quit-ms quits after N ms (Session 72: the
+// frame pacing check; launcher.log shows when the page came and how many frames were drawn). --share-test makes
+// SHARE's zip (<files>/logs/share/wwe2k14_report_NNN.zip, its path in launcher.log) without a share sheet and quits.
+#include "../thread_name.h"  // S102 H1
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <ctime>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <mutex>  // Session 101: the superstars build before PLAY
+#include <string>
+#include <vector>
+
+#include "imgui.h"
+#include "imgui_impl_sdl3.h"
+#include "imgui_impl_sdlrenderer3.h"
+#include "imgui_internal.h"  // ClearActiveID (a touch drag that scrolls must not press the button it started on)
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#include "stb_image.h"
+
+#include "../dlc_catalog.h"
+#include "../launcher/disc_image.h"
+#include "../launcher/dlc_names.h"
+#include "../launcher/game_font.h"
+#include "../launcher/launcher_theme.h"
+#include "../launcher/markdown_imgui.h"
+#include "../launcher/update_check.h"
+#include "../launcher/wm30_list.h"
+#include "mobile_platform.h"
+#include "mobile_settings.h"
+#include "diag_system.h"  // Session 95: system.txt of the diagnostic run
+#include "../diag_plan.h"   // Session 95: the diagnostic run (shared with the PC launcher)
+#include "../diag_logcut.h"  // Session 95 (diag4): the game log cut for the zip (shared)
+#include "phone_check.h"  // Session 73: CHECK THIS PHONE and how the last game run ended
+#include "ladder.h"  // Session 95 (LADDER): run history, SAFE MODE steps, the cards
+#include "share_report.h"  // Session 73: report.txt in the shared zip
+#include "zip_writer.h"
+#include "../tron_zip.h"  // Session 98: IMPORT TRON PREVIEWS (ZIP), the PC launcher's EXPORT FOR PHONE
+#include "../importer/importer_core.h"  // Session 98: the SUPERSTARS list (LoadPack / SavePack)
+#include "../assets/id_names.h"
+#include "../music_core.h"  // Lane 286: what the phone's music player can play (shared with the game)
+#include "music_mods.h"      // Lane 286: the MUSIC group's file rules (the PC launcher's, Windows-free)
+#include "music_library.h"   // Lane 297: the song LIBRARY model (import worker, choices.txt, preview rule)
+#include "../music_sdl_player.h"  // Lane 286: the SDL audio player; the launcher's preview plays through it (lane 297)
+#include <atomic>
+#include <thread>
+
+namespace mlauncher {
+
+namespace theme = launcher::theme;
+namespace music_core = wwe2k14::music_core;
+namespace music_sdl = wwe2k14::music_sdl;
+
+#ifdef WWE2K14_VERSION
+constexpr const char* kVersion = WWE2K14_VERSION;  // android\VERSION
+#else
+constexpr const char* kVersion = "android-dev";
+#endif
+
+// (Session 98: MODS, the Arena Viewer's page, is numbered last so the --page numbers of the other pages stay as they were.)
+enum Page { kHome, kGameFiles, kGraphics, kTouch, kDlc, kWm30, kSaves, kHelp, kMods, kPageCount };
+constexpr const char* kPageNames[kPageCount] = {"HOME",   "GAME FILES", "GRAPHICS", "TOUCH CONTROLS",
+                                                "DLC",    "30 YEARS",   "SAVES",    "LOGS AND UPDATES", "MODS"};
+
+// A disc image by its extension, any case.
+inline bool IsIso(const fs::path& p) {
+  std::string e = U8(p.extension());
+  for (auto& c : e) c = char(std::tolower(static_cast<unsigned char>(c)));
+  return e == ".iso";
+}
+
+constexpr ImU32 kMenuRed = IM_COL32(214, 22, 30, 255);
+constexpr ImVec4 kGood{0.45f, 0.85f, 0.45f, 1}, kBad{1, 0.55f, 0.4f, 1}, kDim{0.62f, 0.63f, 0.68f, 1};
+
+struct Texture {
+  SDL_Texture* tex = nullptr;
+  int w = 0, h = 0;
+  void Reset() {
+    if (tex) SDL_DestroyTexture(tex);
+    tex = nullptr, w = h = 0;
+  }
+  ImTextureRef Ref() const { return ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(tex))); }
+};
+
+Texture MakeTexture(SDL_Renderer* r, const std::vector<uint8_t>& rgba, int w, int h,
+                    SDL_BlendMode blend = SDL_BLENDMODE_BLEND) {
+  Texture t;
+  if (w <= 0 || h <= 0 || rgba.size() < size_t(w) * size_t(h) * 4) return t;
+  t.tex = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h);  // bytes R, G, B, A
+  if (!t.tex) return t;
+  SDL_UpdateTexture(t.tex, nullptr, rgba.data(), w * 4);
+  SDL_SetTextureBlendMode(t.tex, blend);
+  SDL_SetTextureScaleMode(t.tex, SDL_SCALEMODE_LINEAR);
+  t.w = w, t.h = h;
+  return t;
+}
+
+// New pixels for `t`: into the texture it has when the size matches (Session 72: no new texture per page change).
+void SetPixels(SDL_Renderer* r, Texture& t, const std::vector<uint8_t>& rgba, int w, int h, SDL_BlendMode blend) {
+  if (t.tex && t.w == w && t.h == h && rgba.size() >= size_t(w) * size_t(h) * 4) {
+    SDL_UpdateTexture(t.tex, nullptr, rgba.data(), w * 4);
+    return;
+  }
+  t.Reset();
+  t = MakeTexture(r, rgba, w, h, blend);
+}
+
+// What the PC test build was asked to do (--page / --shot ...).
+struct TestSteps {
+  int page = -1, frames = 4, select = -1;
+  bool drawer = false;  // --drawer: the sidebar open
+  bool music_busy = false;  // --music-busy: the shot does not wait for the conversion (a picture of the progress card)
+  int music_play = -1;  // --music-play N: the MUSIC library's song N drawn as playing (no sound), for the picture sheets (lane 297)
+  float scroll = 0;
+  std::string shot;
+  float tap_x = -1, tap_y = -1;  // --tap X,Y: a touch tap there (position, down, up in one batch) at the 3rd frame
+  int quit_ms = 0;               // --quit-ms N: quit N ms after start
+  bool check = false;            // --check: CHECK THIS PHONE at start (Session 73)
+  bool diag_run = false;         // --diag-run: start the DIAGNOSTIC RUN at start (Session 95)
+  bool share = false;            // --share-test: SHARE's zip and report, no share sheet, then quit (Session 73)
+  std::string import_trons;      // --import-trons ZIP: IMPORT TRON PREVIEWS of this zip at start (Session 98)
+};
+
+class App {
+ public:
+  App(SDL_Window* window, SDL_Renderer* renderer, float ui) : window_(window), renderer_(renderer), ui_(ui) {}
+
+  void Start(const TestSteps& test) {
+    test_ = test;
+    files_ = platform::FilesDir();
+    std::error_code ec;
+    fs::create_directories(files_ / "logs", ec);
+    log_.open(files_ / "logs" / "launcher.log", std::ios::trunc);
+    Log("wwe2k14 phone launcher %s on %s, files %s, ui scale %.2f", kVersion, platform::Name(), U8(files_).c_str(), ui_);
+    s_ = LoadSettings(SettingsPath());
+    if (!s_.tier_defaults_applied) {  // Session 95: once per file (a first run, or a file from before the key): AUTO is LOW on a phone, so LOW's starting crowd goes into the slider
+      s_.tier_defaults_applied = true;
+      const bool low = s_.quality_tier != 2, moved = low && ApplyLowStart(s_);
+      Log("settings: tier %s starting values applied once: crowd %d%% (%s)", low ? "LOW" : "STANDARD", s_.crowd_density,
+          moved ? "moved from 100%" : "unchanged");
+      Save();
+    }
+    ScanDrivers();
+    CheckDriver();
+    for (const auto& d : kDrivers) driver_bundled_.push_back(DriverBundled(d.file));
+    if (!driver_ask_.empty()) page_ = kGraphics;  // Session 73: the question at the top of GRAPHICS
+    RefreshGame();
+    ResumeAfterPrecompile();  // Session 93
+    ResumeAfterDiag();        // Session 95
+    ResumeAfterTrons();       // Session 98 (BUILD TRON PREVIEWS)
+    // Session 73: how the last game run ended (src\blackbox.h; LauncherActivity wrote Android's reason first).
+    last_run_ = check::LastRun(files_);
+    if (!last_run_.empty()) {
+      Log("last game run: %s", last_run_.c_str());
+      ShowToast(trons_toast_.empty() ? last_run_ : trons_toast_ + "\n" + last_run_, 12000);  // (Session 98: both after a tron export)
+    } else if (!trons_toast_.empty()) {
+      ShowToast(trons_toast_, 8000);
+    }
+    LadderStart();  // Session 95 (LADDER)
+    if (s_.check_updates && (test_.shot.empty() || std::getenv("WWE2K14_UPDATE_FILE")) && !test_.share) CheckUpdate();
+    if (test_.check) RunCheck();
+    if (test_.diag_run) StartDiag();
+    if (test_.share) ShareLogs(false);
+    if (test_.page >= 0 && test_.page < kPageCount) page_ = Page(test_.page);
+    if (page_ == kSaves) ScanSaves();
+    if (test_.select >= 0) wm30_pick_ = test_.select;
+    if (test_.drawer) drawer_open_ = true;
+    {  // Session 98 (review of the zip import): a kill in the middle of an import's swap must not lose both sets of previews
+      std::error_code ec;
+      if (!fs::exists(TronsPendingPath(), ec)) tron_zip::Recover(TronsDir());
+    }
+    if (!test_.import_trons.empty()) StartTronZipImport(test_.import_trons, U8(fs::u8path(test_.import_trons).filename()));
+  }
+
+  // One frame. Returns false once the PC test's screenshot is saved.
+  bool Frame() {
+    for (platform::Event e; platform::PollEvent(e);) OnEvent(e);
+    DiagFrame();  // Session 95
+    SyncSuperstarsKey();  // Session 98 (importer review): the importer's switch, the same key
+    TronsPoll();  // Session 98: a tron export running behind the launcher
+    PollTronZipImport();  // Session 98 (IMPORT TRON PREVIEWS)
+    PollStars();  // Session 101: the superstars pack built before a PLAY
+    PollMusic();  // Lane 297: the song library's worker, the preview player
+    // Session 93 (M6 step 2): the shader precompile has just ended and brought us back: the PLAY it was for goes on (after a
+    // few frames, so the launcher is up and the platform is ready for the activity switch).
+    if (resume_play_ && ++resume_frames_ > 3) {
+      resume_play_ = false;
+      precompile_skip_once_ = true;
+      Play(resume_wm30_);
+      precompile_skip_once_ = false;  // (a card that stopped the Play must not leave the skip behind: PLAY ANYWAY would start the precompile again)
+      if (disk_card_) skip_precompile_after_card_ = true;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 size = io.DisplaySize;
+    SDL_Rect safe{0, 0, int(size.x), int(size.y)};
+    SDL_GetWindowSafeArea(window_, &safe);  // the camera hole / rounded corners / navigation bar
+    safe_min_ = ImVec2(float(safe.x), float(safe.y));
+    safe_max_ = ImVec2(float(safe.x + safe.w), float(safe.y + safe.h));
+    if (safe.w <= 0 || safe.h <= 0) safe_min_ = ImVec2(0, 0), safe_max_ = size;
+    landscape_ = size.x > size.y;
+
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(size);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::Begin("##root", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
+    if (page_ == kHome) HomePage(size);
+    else SectionPage(size);
+    Toast(size);
+    ImGui::End();
+    MusicProgressCard(size);  // lane 297
+    Drawer(size);
+    if (page_ == kHome || disk_card_ || stars_card_) DrawCard(size);  // Session 95 (LADDER); Session 101: the superstars build
+    return true;
+  }
+
+  // Android's Back, Escape on the PC: closes the sidebar, else one press from any section to the main page, else
+  // leaves the app. A second Back within 250 ms is the same press arriving twice (Android's back callback and SDL's
+  // Back key; Jarrod, 2026-10-28: "Should only take one back input").
+  void Back() {
+    const uint64_t now = SDL_GetTicks();
+    if (now - last_back_ < 250) return;
+    last_back_ = now;
+    if (drawer_open_) drawer_open_ = false;
+    else if (page_ != kHome) GoPage(kHome);
+    else platform::Quit();
+  }
+
+  const TestSteps& test() const { return test_; }
+  const char* PageName() const { return kPageNames[page_]; }
+
+  // Session 72: the next frame must come at once: the sidebar is sliding, ImGui still holds input it has not used (it
+  // spreads a tap's finger position, down and up over three frames), or a gamepad button is held (the menus repeat).
+  bool Busy() const {
+    if (!test_.drawer && drawer_t_ != (drawer_open_ ? 1.f : 0.f)) return true;
+    if (tronzip_ && !tronzip_->done) return true;  // Session 98: the import's progress bar moves
+    if (MusicBusy()) return true;  // Lane 297: a preview's bars move, a song converts
+    if (stars_job_) return true;  // Session 101 (review B1): the superstars build's bar moves, and its end starts the game / shows the card
+    if (ImGui::GetCurrentContext()->InputEventsQueue.Size > 0) return true;
+    for (int k = ImGuiKey_GamepadStart; k <= ImGuiKey_GamepadRStickDown; ++k)
+      if (ImGui::IsKeyDown(ImGuiKey(k))) return true;
+    return false;
+  }
+  // How long the launcher may sleep with no input: until the note at the bottom goes, else until the next event (-1).
+  int IdleWaitMs() const {
+    const uint64_t now = SDL_GetTicks();
+    if (!toast_.empty() && now <= toast_until_) return int(toast_until_ - now) + 1;
+    return -1;
+  }
+
+  void Log(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    SDL_Log("wwe2k14 launcher: %s", buf);
+    char at[24];
+    std::snprintf(at, sizeof(at), "%8.3f ", double(SDL_GetTicks()) / 1000.0);  // seconds since the launcher started
+    if (log_) log_ << at << buf << "\n", log_.flush();
+  }
+
+  // The renderer lost its textures (Android may drop the GL context while the app is in the background).
+  void DeviceReset() {
+    bg_.Reset(), logo_.Reset(), gfont_tex_.Reset();
+    for (Band& b : bands_) b.tex.Reset(), b.made = false;
+    for (auto& kv : thumbs_) kv.second.Reset();
+    thumbs_.clear();
+    font_tried_ = logo_tried_ = false;
+  }
+
+ private:
+  float D(float v) const { return v * ui_; }  // density-independent pixels -> ImGui's
+
+  fs::path SettingsPath() const { return files_ / "launcher_settings.json"; }
+  fs::path DlcDir() const { return files_ / "dlc"; }
+  fs::path UsbGameDir() const { return files_ / "game"; }
+  // The game's save folder: the SDK's default user folder (HOME/.local/share/wwe2k14 on the phone, where the activity
+  // sets HOME to the app folder: SDK windowed_app_main_sdl.cpp, filesystem_posix.cpp GetUserFolder).
+  fs::path SaveDir() const { return files_ / ".local" / "share" / "wwe2k14"; }
+  // Session 98 (importer review): the Superstar Importer edits this file's "superstars" key; every save reads it first (sync = false
+  // only right after this launcher's own USE MY SUPERSTARS toggle, whose new value must win).
+  void Save(bool sync = true) {
+    if (sync) SyncSuperstarsKey(true);
+    if (!SaveSettings(SettingsPath(), s_)) Log("settings: could not write %s", U8(SettingsPath()).c_str());
+  }
+  // Every frame (a stat; the key is read when the file changed), before every save and every game launch (MakeContext).
+  fs::file_time_type stars_key_time_{};
+  void SyncSuperstarsKey(bool force = false) {
+    std::error_code ec;
+    const fs::file_time_type t = fs::last_write_time(SettingsPath(), ec);
+    if (ec || (!force && t == stars_key_time_)) return;
+    stars_key_time_ = t;
+    try {
+      std::ifstream f(SettingsPath(), std::ios::binary);
+      if (!f) return;
+      const nlohmann::json j = nlohmann::json::parse(f);
+      if (j.is_object() && j.contains("superstars") && j["superstars"].is_boolean()) s_.superstars = j["superstars"].get<bool>();
+    } catch (...) {
+    }
+  }
+
+  void GoPage(Page p) {
+    if (p != page_) Log("page: %s", kPageNames[p]);
+    page_ = p;
+    drawer_open_ = false;
+    scroll_reset_ = true;
+    if (p == kDlc && !dlc_scanned_) ScanDlc();
+    if (p == kSaves) ScanSaves();
+  }
+
+  // ---------------------------------------------------------------- game files
+  // The picked file wins; else <files>/game over USB (default.xex there = an extracted copy, else the first .iso).
+  void RefreshGame() {
+    read_path_.clear(), address_.clear(), game_from_usb_ = false;
+    game_error_.clear();
+    if (!s_.game_uri.empty()) {
+      read_path_ = platform::OpenGameFile(s_.game_uri);
+      if (read_path_.empty()) game_error_ = "The chosen file can't be opened or read in place (moved, deleted, on a removed card, or in a cloud folder: copy it to the phone's own storage and choose it again)";
+      else address_ = s_.game_uri;
+    }
+    if (read_path_.empty()) {
+      std::error_code ec;
+      fs::path usb;
+      if (fs::is_regular_file(UsbGameDir() / "default.xex", ec)) usb = UsbGameDir();
+      else
+        for (const auto& e : fs::directory_iterator(UsbGameDir(), ec))
+          if (e.is_regular_file(ec) && IsIso(e.path())) {
+            usb = e.path();
+            break;
+          }
+      if (!usb.empty()) read_path_ = address_ = U8(usb), game_from_usb_ = true;
+    }
+    files_reader_.SetRoot(fs::u8path(read_path_));
+    game_ok_ = !read_path_.empty() && files_reader_.Exists("default.xex");
+    if (!read_path_.empty() && !game_ok_)
+      game_error_ = files_reader_.image_error().empty() ? "No default.xex in these game files"
+                                                        : "Not a readable disc image: " + files_reader_.image_error();
+    Log("game files: %s (%s) %s", read_path_.empty() ? "none" : read_path_.c_str(),
+        game_from_usb_ ? "USB folder" : "picked", game_ok_ ? "ok" : game_error_.c_str());
+    font_tried_ = false, gfont_tex_.Reset();
+    wm30_ = {}, wm30_pick_ = -1;
+  }
+
+  // ---------------------------------------------------------------- menu font (game_font.h) and pictures
+  void LoadMenuFont() {
+    if (font_tried_) return;
+    font_tried_ = true;
+    if (!game_ok_ || !launcher::LoadGameFont(files_reader_, gfont_)) {
+      Log("menu font: not in the game files; using the fallback");
+      return;
+    }
+    gfont_tex_ = MakeTexture(renderer_, launcher::DecodeBc3(gfont_.bc3, gfont_.sheet_w, gfont_.sheet_h),
+                             gfont_.sheet_w, gfont_.sheet_h);
+    gfont_.bc3 = {};
+    Log("menu font: the game's font000 (%zu glyphs)", gfont_.glyphs.size());
+  }
+
+  static uint32_t NextCodepoint(const char*& p) {
+    const auto c = static_cast<unsigned char>(*p++);
+    if (c < 0x80) return c;
+    const int extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+    uint32_t cp = c & (0x3Fu >> extra);
+    for (int i = 0; i < extra && (static_cast<unsigned char>(*p) & 0xC0) == 0x80; ++i) cp = cp << 6 | (*p++ & 0x3F);
+    return cp;
+  }
+  ImVec2 MenuTextSize(float px, const char* text) {
+    LoadMenuFont();
+    if (gfont_tex_.tex) {
+      const float k = px / gfont_.cell;
+      float w = 0;
+      for (const char* p = text; *p;) {
+        const auto it = gfont_.glyphs.find(NextCodepoint(p));
+        w += (it != gfont_.glyphs.end() ? it->second.w : gfont_.cell * 0.33f) * k;
+      }
+      return ImVec2(w, px);
+    }
+    ImGui::PushFont(menu_font_, px * 0.8f);
+    const ImVec2 sz = ImGui::CalcTextSize(text);
+    ImGui::PopFont();
+    return ImVec2(sz.x, px);
+  }
+  void MenuTextRaw(ImDrawList* dl, ImVec2 pos, float px, ImU32 col, const char* text) {
+    LoadMenuFont();
+    if (!gfont_tex_.tex) {
+      ImGui::PushFont(menu_font_, px * 0.8f);
+      dl->AddText(ImVec2(pos.x, pos.y + px * 0.08f), col, text);
+      ImGui::PopFont();
+      return;
+    }
+    const float k = px / gfont_.cell, iw = 1.f / float(gfont_.sheet_w), ih = 1.f / float(gfont_.sheet_h);
+    float x = std::floor(pos.x);
+    const float y = std::floor(pos.y);
+    for (const char* p = text; *p;) {
+      const auto it = gfont_.glyphs.find(NextCodepoint(p));
+      if (it == gfont_.glyphs.end()) {
+        x += gfont_.cell * 0.33f * k;
+        continue;
+      }
+      const launcher::GameFont::Glyph& g = it->second;
+      dl->AddImage(gfont_tex_.Ref(), ImVec2(x, y), ImVec2(x + g.w * k, y + g.h * k), ImVec2(g.x * iw, g.y * ih),
+                   ImVec2((g.x + g.w) * iw, (g.y + g.h) * ih), col);
+      x += g.w * k;
+    }
+  }
+  void MenuText(ImDrawList* dl, ImVec2 pos, float px, ImU32 col, const char* text) {
+    const float o = std::max(1.f, px * 0.06f);
+    MenuTextRaw(dl, ImVec2(pos.x + o, pos.y + o), px, IM_COL32(0, 0, 0, 190), text);
+    MenuTextRaw(dl, pos, px, col, text);
+  }
+
+  // The logo (assets\launcher\wwe2k14_logo.png: in the APK's assets, next to the PC test exe), at most `width` wide.
+  ImVec2 DrawLogo(ImDrawList* dl, ImVec2 center_top, float width) {
+    if (!logo_tried_) {
+      logo_tried_ = true;
+      SDL_Surface* s = SDL_LoadPNG("wwe2k14_logo.png");
+      if (!s) {
+        const char* base = SDL_GetBasePath();
+        if (base) s = SDL_LoadPNG((std::string(base) + "wwe2k14_logo.png").c_str());
+      }
+      if (s) {
+        if (SDL_Surface* c = SDL_ConvertSurface(s, SDL_PIXELFORMAT_ABGR8888)) {
+          logo_px_.assign(static_cast<uint8_t*>(c->pixels), static_cast<uint8_t*>(c->pixels) + size_t(c->pitch) * c->h);
+          logo_w_ = c->w, logo_h_ = c->h;
+          if (c->pitch != c->w * 4) logo_px_.clear();  // ABGR8888 rows are packed; anything else is unexpected
+          SDL_DestroySurface(c);
+        }
+        SDL_DestroySurface(s);
+      }
+      if (logo_px_.empty()) Log("logo: wwe2k14_logo.png not found (%s)", SDL_GetError());
+    }
+    if (logo_px_.empty()) {
+      const float px = std::min(width / 6.f, D(64));
+      const ImVec2 ts = MenuTextSize(px, "WWE 2K14");
+      MenuText(dl, ImVec2(center_top.x - ts.x / 2, center_top.y), px, IM_COL32_WHITE, "WWE 2K14");
+      return ts;
+    }
+    const int w = std::clamp(int(width) / 8 * 8, 16, logo_w_);
+    const int h = std::max(1, int(std::lround(double(logo_h_) * w / logo_w_)));
+    if (!logo_.tex || logo_.w != w)
+      logo_.Reset(), logo_ = MakeTexture(renderer_, w == logo_w_ ? logo_px_ : theme::Resample(logo_px_.data(), logo_w_, logo_h_, w, h), w, h);
+    const ImVec2 p(std::floor(center_top.x - w / 2.f), std::floor(center_top.y));
+    dl->AddImage(logo_.Ref(), p, ImVec2(p.x + float(w), p.y + float(h)));
+    return ImVec2(float(w), float(h));
+  }
+
+  // The dots: one opaque picture for the whole screen, made once per screen size. The red band: a picture of just its
+  // box, blended over the dots (theme::PanelPicture), one kept for the main page and one for the sections, so a page
+  // change remakes at most a header-sized picture. Session 72: before, every page change remade the whole screen's
+  // picture (1440 x 3168 on Jarrod's phone, 18 MB) and a new texture for it.
+  enum BandSlot { kBandHome, kBandSection, kBandSlots };
+  void DrawBackground(ImVec2 size, const theme::Panel& p, BandSlot slot) {
+    const int w = int(size.x), h = int(size.y);
+    if (w <= 0 || h <= 0) return;
+    const float dpi = ui_ * 0.9f;
+    if (!bg_.tex || bg_.w != w || bg_.h != h) {
+      const uint64_t t0 = SDL_GetTicksNS();
+      SetPixels(renderer_, bg_, theme::Background(w, h, dpi, theme::Panel{}), w, h, SDL_BLENDMODE_NONE);
+      Log("background: %d x %d made in %.1f ms", w, h, double(SDL_GetTicksNS() - t0) / 1e6);
+    }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (bg_.tex) dl->AddImage(bg_.Ref(), ImVec2(0, 0), ImVec2(float(w), float(h)));
+    Band& b = bands_[slot];
+    const std::array<float, 8> key{size.x, size.y, p.x0, p.y0, p.w, p.h, p.slant, p.straight_left ? 1.f : 0.f};
+    if (!b.made || key != b.key) {
+      int bw = 0, bh = 0;
+      const std::vector<uint8_t> px = theme::PanelPicture(w, h, dpi, p, b.x, b.y, bw, bh);
+      if (bw > 0 && bh > 0) SetPixels(renderer_, b.tex, px, bw, bh, SDL_BLENDMODE_BLEND);
+      else b.tex.Reset();
+      b.key = key, b.made = true;
+    }
+    if (b.tex.tex)
+      dl->AddImage(b.tex.Ref(), ImVec2(float(b.x), float(b.y)), ImVec2(float(b.x + b.tex.w), float(b.y + b.tex.h)));
+  }
+
+  // A slanted button (the PC's PLAY GAME tile): red, white rim, the label in the menu font, shrunk to fit.
+  bool SlantButton(const char* label, ImVec2 pos, ImVec2 size, bool enabled, float font_px) {
+    const float sk = size.y * 0.22f;
+    ImGui::SetCursorScreenPos(pos);
+    ImGui::BeginDisabled(!enabled);
+    const bool pressed = ImGui::InvisibleButton(label, size);
+    ImGui::EndDisabled();
+    const bool held = enabled && ImGui::IsItemActive();
+    ImU32 top = IM_COL32(160, 20, 28, 255), bottom = IM_COL32(82, 8, 12, 255);
+    if (!enabled) top = IM_COL32(66, 66, 72, 255), bottom = IM_COL32(40, 40, 45, 255);
+    else if (held) top = IM_COL32(205, 30, 38, 255), bottom = IM_COL32(118, 12, 18, 255);
+    const ImVec2 q[4] = {{pos.x + sk, pos.y}, {pos.x + size.x, pos.y}, {pos.x + size.x - sk, pos.y + size.y},
+                         {pos.x, pos.y + size.y}};
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+    const auto i0 = ImDrawIdx(dl->_VtxCurrentIdx);
+    dl->PrimReserve(6, 4);  // a top-to-bottom gradient quad
+    dl->PrimWriteIdx(i0), dl->PrimWriteIdx(ImDrawIdx(i0 + 1)), dl->PrimWriteIdx(ImDrawIdx(i0 + 2));
+    dl->PrimWriteIdx(i0), dl->PrimWriteIdx(ImDrawIdx(i0 + 2)), dl->PrimWriteIdx(ImDrawIdx(i0 + 3));
+    dl->PrimWriteVtx(q[0], uv, top), dl->PrimWriteVtx(q[1], uv, top);
+    dl->PrimWriteVtx(q[2], uv, bottom), dl->PrimWriteVtx(q[3], uv, bottom);
+    dl->AddPolyline(q, 4, enabled ? IM_COL32_WHITE : IM_COL32(150, 150, 156, 255), ImDrawFlags_Closed, D(2.5f));
+    const std::string text(label, ImGui::FindRenderedTextEnd(label));
+    ImVec2 ts = MenuTextSize(font_px, text.c_str());
+    const float room = size.x - 2 * sk - D(12);
+    if (ts.x > room) font_px *= room / ts.x, ts = MenuTextSize(font_px, text.c_str());
+    MenuText(dl, ImVec2(pos.x + (size.x - ts.x) / 2, pos.y + (size.y - ts.y) / 2), font_px,
+             enabled ? IM_COL32_WHITE : IM_COL32(170, 170, 176, 255), text.c_str());
+    return pressed;
+  }
+
+  // ---------------------------------------------------------------- the main page
+  // Portrait: the logo, PLAY and the sections on the red band below. Landscape: the band on the left (the PC
+  // launcher's sidebar) with the sections, the logo and PLAY on the right.
+  void HomePage(ImVec2 size) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    static constexpr Page kItems[] = {kGameFiles, kGraphics, kTouch, kDlc, kMods, kWm30, kSaves, kHelp};
+    const int n = int(std::size(kItems));
+    // Landscape: the rows share the height (a phone on its side is ~410 dp tall).
+    const float row = landscape_ ? std::min(D(54), (safe_max_.y - safe_min_.y - D(36)) / float(n)) : D(54);
+    const float menu_px = std::min(D(30), row * 0.56f);
+    theme::Panel band;
+    ImVec2 hero_min, hero_max;  // where the logo and PLAY go
+    if (landscape_) {
+      band.x0 = 0, band.y0 = 0, band.h = size.y, band.straight_left = true;
+      band.w = std::min(size.x * 0.46f, D(430)) + safe_min_.x;
+      band.slant = std::min(band.h * 0.16f, band.w * 0.25f);
+      hero_min = ImVec2(band.w, safe_min_.y), hero_max = ImVec2(safe_max_.x, safe_max_.y);
+    } else {
+      const float list_h = row * n + D(28);
+      band.x0 = 0, band.straight_left = true, band.h = list_h + (size.y - safe_max_.y) + D(48);
+      band.y0 = size.y - band.h, band.w = size.x, band.slant = 0;
+      hero_min = safe_min_, hero_max = ImVec2(safe_max_.x, band.y0);
+    }
+    DrawBackground(size, band, kBandHome);
+    // The red band's top edge leans in portrait (the game's panels): a dark wedge over its right end.
+    if (!landscape_) {
+      const ImVec2 wedge[3] = {{size.x * 0.35f, band.y0 - 1}, {size.x + 1, band.y0 - 1}, {size.x + 1, band.y0 + D(40)}};
+      dl->AddTriangleFilled(wedge[0], wedge[1], wedge[2], IM_COL32(17, 18, 21, 255));
+      dl->AddLine(ImVec2(0, band.y0 + D(1)), ImVec2(size.x * 0.35f, band.y0 + D(1)), IM_COL32(255, 255, 255, 150), D(1.5f));
+      dl->AddLine(ImVec2(size.x * 0.35f, band.y0 + D(1)), ImVec2(size.x, band.y0 + D(41)), IM_COL32(255, 255, 255, 150), D(1.5f));
+    } else {
+      dl->AddLine(ImVec2(band.x0 + band.w, band.y0), ImVec2(band.x0 + band.w - band.slant, band.y0 + band.h),
+                  IM_COL32(255, 255, 255, 170), D(1.6f));
+    }
+
+    // The hero: logo, PLAY, the game files' state.
+    const float hw = hero_max.x - hero_min.x, hh = hero_max.y - hero_min.y;
+    const float play_h = D(76), play_w = std::min(hw - D(48), D(420));
+    const float logo_w = std::min({hw - D(56), D(560), (hh - play_h - D(110)) * 1280.f / 617.f});
+    const float logo_h = logo_px_.empty() ? D(64) : logo_w * float(logo_h_ > 0 ? logo_h_ : 617) / float(logo_w_ > 0 ? logo_w_ : 1280);
+    const float block = logo_h + D(28) + play_h + D(14) + ImGui::GetTextLineHeight();
+    float y = hero_min.y + std::max(D(16), (hh - block) / 2);
+    DrawLogo(dl, ImVec2(hero_min.x + hw / 2, y), logo_w);
+    if (!logo_px_.empty()) {  // Session 81 (Jarrod): the byline where the PC launcher has it, under "2K14"
+      const char* by = "BY JARRODFENG";
+      const float px = D(15), cx = hero_min.x + hw / 2 - logo_w / 2 + logo_w * 0.655f;
+      MenuText(dl, ImVec2(cx - MenuTextSize(px, by).x / 2, y + logo_h * 0.69f), px, IM_COL32(255, 255, 255, 150), by);
+    }
+    y += logo_h + D(28);
+    if (SlantButton("PLAY", ImVec2(hero_min.x + (hw - play_w) / 2, y), ImVec2(play_w, play_h), !TronZipRunning(), D(44))) Play();
+    y += play_h + D(14);
+    {
+      const std::string st = game_ok_ ? "Game files: " + GameName() : "Choose your game files to play";
+      const ImVec2 ts = ImGui::CalcTextSize(st.c_str());
+      ImGui::SetCursorScreenPos(ImVec2(hero_min.x + (hw - std::min(ts.x, hw)) / 2, y));
+      ImGui::PushStyleColor(ImGuiCol_Text, game_ok_ ? kDim : kBad);
+      ImGui::TextUnformatted(st.c_str());
+      ImGui::PopStyleColor();
+    }
+
+    // The sections: rows on the band, each a little further left down the slant (the game's staircase).
+    const float top = landscape_ ? std::max(safe_min_.y + D(10), (size.y - row * n) / 2) : band.y0 + D(36);
+    const float left = landscape_ ? safe_min_.x + D(26) : safe_min_.x + D(26);
+    for (int i = 0; i < n; ++i) {
+      const float y0 = top + row * float(i), y1 = y0 + row, yc = (y0 + y1) / 2;
+      const float x_left = landscape_ ? band.Left(y0) : 0, x_right = landscape_ ? band.Right(y0) : size.x;
+      ImGui::SetCursorScreenPos(ImVec2(x_left, y0));
+      ImGui::PushID(i);
+      const bool pressed = ImGui::InvisibleButton("##nav", ImVec2(x_right - x_left, row));
+      ImGui::PopID();
+      const bool held = ImGui::IsItemActive() && !dragging_;
+      if (held || ImGui::IsItemFocused()) {
+        const float r0 = landscape_ ? band.Right(y0) : size.x, r1 = landscape_ ? band.Right(y1) : size.x;
+        const ImVec2 bar[4] = {{x_left, y0}, {r0, y0}, {r1, y1}, {x_left, y1}};
+        dl->AddConvexPolyFilled(bar, 4, IM_COL32(0, 0, 0, held ? 255 : 120));
+      }
+      const float step = landscape_ ? band.Right(top) - band.Right(yc) : 0;
+      const ImVec2 at(left + D(8) - step * 0.0f, yc - menu_px / 2);
+      if (held) MenuTextRaw(dl, at, menu_px, kMenuRed, kPageNames[kItems[i]]);
+      else MenuText(dl, at, menu_px, IM_COL32_WHITE, kPageNames[kItems[i]]);
+      // A chevron at the row's right end: it opens.
+      const float cx = (landscape_ ? band.Right(yc) - band.slant * 0.15f : safe_max_.x) - D(30);
+      dl->AddTriangleFilled(ImVec2(cx, yc - D(8)), ImVec2(cx + D(9), yc), ImVec2(cx, yc + D(8)), IM_COL32(255, 255, 255, 200));
+      if (pressed && !drag_cancelled_) GoPage(kItems[i]);
+    }
+    // The version: at the band's foot (portrait), the screen's bottom right (landscape).
+    const float vx = landscape_ ? safe_max_.x - ImGui::CalcTextSize(kVersion).x - D(16) : left;
+    ImGui::SetCursorScreenPos(ImVec2(vx, safe_max_.y - ImGui::GetTextLineHeight() - D(8)));
+    ImGui::TextColored(ImVec4(1, 1, 1, 0.6f), "%s", kVersion);
+    {  // Session 81 (Jarrod): across from the version, the same styling
+      const char* credit = "Recomp by Jarrodfeng";
+      const float cx = landscape_ ? left : safe_max_.x - ImGui::CalcTextSize(credit).x - D(16);
+      ImGui::SetCursorScreenPos(ImVec2(cx, safe_max_.y - ImGui::GetTextLineHeight() - D(8)));
+      ImGui::TextColored(ImVec4(1, 1, 1, 0.6f), "%s", credit);
+    }
+  }
+
+  // ---------------------------------------------------------------- a section: the header with the hamburger, then
+  // the page in a scrolling area (touch drags scroll it).
+  void SectionPage(ImVec2 size) {
+    const float head = D(64);
+    const ImVec2 hb(safe_min_.x + D(6), safe_min_.y + D(6));
+    // The red band reaches past the title (Jarrod: "TOUCH CONTROLS" / "LOGS AND UPDATES" ran past it); the title
+    // shrinks when the screen is too narrow for it.
+    theme::Panel band;
+    band.x0 = 0, band.y0 = 0, band.h = safe_min_.y + head, band.straight_left = true;
+    band.slant = band.h * 0.5f;
+    const float title_x = hb.x + D(64);
+    float title_px = D(32), title_w = MenuTextSize(title_px, kPageNames[page_]).x;
+    const float room = size.x - title_x - band.slant - D(16);
+    if (title_w > room) title_px *= room / title_w, title_w = room;
+    band.w = std::clamp(title_x + title_w + D(28) + band.slant, std::min(size.x, D(300)), size.x);
+    DrawBackground(size, band, kBandSection);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddLine(ImVec2(band.w, 0), ImVec2(band.w - band.slant, band.h), IM_COL32(255, 255, 255, 170), D(1.6f));
+
+    // The hamburger: the sidebar with HOME and every section (Jarrod, 2026-10-28).
+    ImGui::SetCursorScreenPos(hb);
+    if (ImGui::InvisibleButton("##menu", ImVec2(D(52), D(52)))) drawer_open_ = true;
+    {
+      const bool held = ImGui::IsItemActive();
+      if (held) dl->AddRectFilled(hb, ImVec2(hb.x + D(52), hb.y + D(52)), IM_COL32(0, 0, 0, 120), D(4));
+      HamburgerIcon(dl, hb);
+    }
+    MenuText(dl, ImVec2(title_x, safe_min_.y + (head - title_px) / 2), title_px, IM_COL32_WHITE, kPageNames[page_]);
+
+    // The page: at most ~760 dp wide, centred (landscape gets wider pages, not a different layout).
+    const float pad = D(16), max_w = D(760);
+    const float avail = safe_max_.x - safe_min_.x - 2 * pad;
+    const float w = std::min(avail, max_w);
+    const float x0 = safe_min_.x + pad + (avail - w) / 2;
+    float bottom_bar = (page_ == kWm30) ? D(92) : 0;
+    ImGui::SetCursorScreenPos(ImVec2(x0, band.h + D(8)));
+    ImGui::BeginChild("##page", ImVec2(w, safe_max_.y - band.h - D(8) - bottom_bar), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
+    if (scroll_reset_) ImGui::SetScrollY(test_.scroll), scroll_reset_ = false;
+    TouchScroll();
+    switch (page_) {
+      case kGameFiles: GameFilesPage(); break;
+      case kGraphics: GraphicsPage(); break;
+      case kTouch: TouchPage(); break;
+      case kDlc: DlcPage(); break;
+      case kMods: ModsPage(); break;
+      case kWm30: Wm30Page(); break;
+      case kSaves: SavesPage(); break;
+      case kHelp: HelpPage(); break;
+      default: break;
+    }
+    ImGui::Dummy(ImVec2(1, D(24)));
+    ImGui::EndChild();
+    if (page_ == kWm30) Wm30Bar(ImVec2(x0, safe_max_.y - bottom_bar), w);
+  }
+
+  void HamburgerIcon(ImDrawList* dl, ImVec2 at) {
+    for (int i = 0; i < 3; ++i) {
+      const float ly = at.y + D(17) + D(9) * i;
+      dl->AddRectFilled(ImVec2(at.x + D(13), ly), ImVec2(at.x + D(39), ly + D(3)), IM_COL32_WHITE, D(1.5f));
+    }
+  }
+
+  // The sidebar the hamburger opens (Jarrod, 2026-10-28: "the burger menu actually opening a sidebar that would get you
+  // back to the other menus, home button at top"): a red band from the left like the PC launcher's page list, HOME on
+  // top, then every section; the open one a black bar with red text. A tap beside it, the hamburger again or Back
+  // closes it.
+  void Drawer(ImVec2 size) {
+    const float dt = std::min(ImGui::GetIO().DeltaTime, 0.05f);
+    drawer_t_ = std::clamp(drawer_t_ + (drawer_open_ ? dt : -dt) / 0.16f, 0.f, 1.f);
+    if (test_.drawer) drawer_t_ = 1;
+    if (drawer_t_ <= 0) return;
+    const float ease = 1 - (1 - drawer_t_) * (1 - drawer_t_);
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(size);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::Begin("##drawer", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
+    ImGui::PopStyleVar();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(0, 0), size, IM_COL32(0, 0, 0, int(160 * ease)));
+
+    static constexpr Page kItems[] = {kHome, kGameFiles, kGraphics, kTouch, kDlc, kMods, kWm30, kSaves, kHelp};
+    const int n = int(std::size(kItems));
+    const float w = std::min(D(330), size.x * 0.84f) + safe_min_.x, off = -(1 - ease) * w;
+    theme::Panel p;
+    p.x0 = off, p.y0 = 0, p.w = w, p.h = size.y, p.straight_left = true;
+    p.slant = std::min(size.y * 0.12f, w * 0.22f);
+    {  // the band: the game's red, top to bottom, with the light rim on its leaning edge
+      const ImVec2 q[4] = {{p.x0, 0}, {p.x0 + p.w, 0}, {p.x0 + p.w - p.slant, size.y}, {p.x0, size.y}};
+      const ImU32 top = IM_COL32(int(theme::kRedTop.r * 255), int(theme::kRedTop.g * 255), int(theme::kRedTop.b * 255), 255);
+      const ImU32 bottom =
+          IM_COL32(int(theme::kRedBottom.r * 255), int(theme::kRedBottom.g * 255), int(theme::kRedBottom.b * 255), 255);
+      const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+      const auto i0 = ImDrawIdx(dl->_VtxCurrentIdx);
+      dl->PrimReserve(6, 4);
+      dl->PrimWriteIdx(i0), dl->PrimWriteIdx(ImDrawIdx(i0 + 1)), dl->PrimWriteIdx(ImDrawIdx(i0 + 2));
+      dl->PrimWriteIdx(i0), dl->PrimWriteIdx(ImDrawIdx(i0 + 2)), dl->PrimWriteIdx(ImDrawIdx(i0 + 3));
+      dl->PrimWriteVtx(q[0], uv, top), dl->PrimWriteVtx(q[1], uv, top);
+      dl->PrimWriteVtx(q[2], uv, bottom), dl->PrimWriteVtx(q[3], uv, bottom);
+      dl->AddLine(q[1], q[2], IM_COL32(255, 255, 255, 170), D(1.6f));
+    }
+    // The hamburger again, in the same place: it closes the sidebar.
+    const ImVec2 hb(off + safe_min_.x + D(6), safe_min_.y + D(6));
+    ImGui::SetCursorScreenPos(hb);
+    if (ImGui::InvisibleButton("##close", ImVec2(D(52), D(52)))) drawer_open_ = false;
+    HamburgerIcon(dl, hb);
+    const float top = safe_min_.y + D(72);
+    const float row = std::min(D(56), (safe_max_.y - top - D(12)) / float(n));
+    const float px = std::min(D(28), row * 0.55f);
+    for (int i = 0; i < n; ++i) {
+      const float y0 = top + row * float(i), y1 = y0 + row, yc = (y0 + y1) / 2;
+      ImGui::SetCursorScreenPos(ImVec2(p.x0, y0));
+      ImGui::PushID(i);
+      const bool pressed = ImGui::InvisibleButton("##item", ImVec2(p.Right(y1) - p.x0, row));
+      ImGui::PopID();
+      const bool on = page_ == kItems[i], held = ImGui::IsItemActive();
+      if (on || held) {
+        const ImVec2 bar[4] = {{p.x0, y0}, {p.Right(y0), y0}, {p.Right(y1), y1}, {p.x0, y1}};
+        dl->AddConvexPolyFilled(bar, 4, IM_COL32(0, 0, 0, on ? 255 : 120));
+      }
+      const ImVec2 at(p.x0 + safe_min_.x + D(24), yc - px / 2);
+      if (on) MenuTextRaw(dl, at, px, kMenuRed, kPageNames[kItems[i]]);
+      else MenuText(dl, at, px, IM_COL32_WHITE, kPageNames[kItems[i]]);
+      if (pressed && drawer_t_ >= 1) GoPage(kItems[i]);
+    }
+    // A tap beside the band closes it.
+    if (p.x0 + p.w < size.x) {
+      ImGui::SetCursorScreenPos(ImVec2(p.x0 + p.w, 0));
+      if (ImGui::InvisibleButton("##outside", ImVec2(size.x - (p.x0 + p.w), size.y))) drawer_open_ = false;
+    }
+    ImGui::End();
+  }
+
+  // Touch: a vertical drag scrolls the page and cancels the press it began on (ImGui has no touch scrolling).
+  void TouchScroll() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (!ImGui::IsMouseDown(0)) {
+      dragging_ = false;
+      drag_cancelled_ = false;
+      return;
+    }
+    if (!dragging_ && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
+      const ImVec2 d = ImGui::GetMouseDragDelta(0, 0);
+      if (std::fabs(d.y) > D(10) && std::fabs(d.y) > std::fabs(d.x) * 1.2f && !slider_active_) dragging_ = true;
+    }
+    if (dragging_) {
+      ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
+      ImGui::ClearActiveID();
+      drag_cancelled_ = true;
+    }
+    slider_active_ = false;
+  }
+
+  // ---------------------------------------------------------------- widgets (finger-sized)
+  void GroupTitle(const char* text) {
+    ImGui::Dummy(ImVec2(1, D(10)));
+    const float px = D(21);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    MenuText(ImGui::GetWindowDrawList(), p, px, IM_COL32(235, 70, 70, 255), text);
+    if (title_underline_) {  // Session 94 (Jarrod): a short red accent under each GRAPHICS section title
+      const float uw = std::min(MenuTextSize(px, text).x, ImGui::GetContentRegionAvail().x);
+      const ImU32 red = IM_COL32(int(theme::kRedTop.r * 255), int(theme::kRedTop.g * 255), int(theme::kRedTop.b * 255), 255);
+      ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, p.y + px + D(5)), ImVec2(p.x + uw, p.y + px + D(7.5f)), red);
+      ImGui::Dummy(ImVec2(1, px + D(12)));
+    } else {
+      ImGui::Dummy(ImVec2(1, px + D(6)));
+    }
+  }
+  bool title_underline_ = false;
+  void Note(const char* text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
+  }
+  // A full-width row; returns true when tapped (not when a drag scrolled over it).
+  bool Row(const char* id, float h, bool selected, ImVec2* out_min = nullptr) {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const bool pressed = ImGui::InvisibleButton(id, ImVec2(w, h)) && !drag_cancelled_;
+    const bool held = ImGui::IsItemActive() && !dragging_;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 bg = held ? IM_COL32(120, 16, 22, 255) : selected ? IM_COL32(32, 8, 10, 235) : IM_COL32(30, 31, 37, 215);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), bg, D(3));
+    if (selected) dl->AddRectFilled(p, ImVec2(p.x + D(5), p.y + h), kMenuRed, D(3), ImDrawFlags_RoundCornersLeft);
+    if (ImGui::IsItemFocused()) dl->AddRect(p, ImVec2(p.x + w, p.y + h), IM_COL32(255, 255, 255, 160), D(3), 0, D(1.5f));
+    if (out_min) *out_min = p;
+    ImGui::Dummy(ImVec2(0, D(4)) );
+    return pressed;
+  }
+  // Wrapped text height / drawing (the narrow two-column layout wraps labels and notes instead of clipping them).
+  float WordMin(const char* text, float scale) const {  // the longest word's width: wrapping never goes below it
+    float m = 0;
+    std::string t(text), w;
+    t += ' ';
+    for (char c : t) {
+      if (c == ' ') {
+        if (!w.empty()) m = std::max(m, ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize() * scale, FLT_MAX, 0, w.c_str()).x);
+        w.clear();
+      } else w += c;
+    }
+    return m;
+  }
+  float WrapH(const char* text, float scale, float wrap) const {
+    wrap = std::max(wrap, WordMin(text, scale));
+    return ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize() * scale, FLT_MAX, wrap, text).y;
+  }
+  void WrapText(ImDrawList* dl, ImVec2 at, const char* text, float scale, float wrap, ImU32 col) const {
+    wrap = std::max(wrap, WordMin(text, scale));
+    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * scale, at, col, text, nullptr, wrap);
+  }
+  // One choice of a list; returns true when picked. `note` is a dim line under the label (wrapped).
+  bool Choice(const char* label, bool selected, const char* note = nullptr) {
+    ImVec2 p;
+    const float aw = ImGui::GetContentRegionAvail().x, tw = std::max(D(40), aw - D(14) - D(38));
+    const float lh = WrapH(label, 1.f, tw), nh = note ? WrapH(note, 0.82f, tw) : 0;
+    const float h = std::max(D(52), lh + (note ? nh + D(3) : 0) + D(20));
+    ImGui::PushID(label);
+    const bool r = Row("##c", h, selected, &p);
+    ImGui::PopID();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float ty = p.y + (h - lh - (note ? nh + D(3) : 0)) / 2;
+    WrapText(dl, ImVec2(p.x + D(14), ty), label, 1.f, tw, IM_COL32_WHITE);
+    if (note) WrapText(dl, ImVec2(p.x + D(14), ty + lh + D(3)), note, 0.82f, tw, ImGui::GetColorU32(kDim));
+    const float cx = p.x + aw - D(22), cy = p.y + h / 2;
+    dl->AddCircle(ImVec2(cx, cy), D(10), IM_COL32(200, 200, 206, 255), 0, D(2));
+    if (selected) dl->AddCircleFilled(ImVec2(cx, cy), D(6), kMenuRed);
+    return r;
+  }
+  bool Toggle(const char* label, bool& v, const char* note = nullptr) {
+    ImVec2 p;
+    const float aw = ImGui::GetContentRegionAvail().x, tw = std::max(D(40), aw - D(14) - D(50) - D(6));
+    const float lh = WrapH(label, 1.f, tw), nh = note ? WrapH(note, 0.82f, tw) : 0;
+    const float h = std::max(note ? D(68) : D(52), lh + (note ? nh + D(3) : 0) + D(20));
+    ImGui::PushID(label);
+    const bool r = Row("##t", h, false, &p);
+    ImGui::PopID();
+    if (r) v = !v;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float ty = p.y + (h - lh - (note ? nh + D(3) : 0)) / 2;
+    const float sx = p.x + aw - D(50), sy = p.y + h / 2 - D(11);
+    WrapText(dl, ImVec2(p.x + D(14), ty), label, 1.f, tw, IM_COL32_WHITE);
+    if (note) WrapText(dl, ImVec2(p.x + D(14), ty + lh + D(3)), note, 0.82f, tw, ImGui::GetColorU32(kDim));
+    dl->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + D(40), sy + D(22)), v ? kMenuRed : IM_COL32(70, 72, 80, 255), D(11));
+    dl->AddCircleFilled(ImVec2(v ? sx + D(29) : sx + D(11), sy + D(11)), D(8.5f), IM_COL32_WHITE);
+    return r;
+  }
+  bool Slider(const char* label, int& v, int lo, int hi, const char* fmt) {
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(-1);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(D(10), D(14)));
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, D(30));
+    const bool r = ImGui::SliderInt((std::string("##") + label).c_str(), &v, lo, hi, fmt);
+    if (ImGui::IsItemActive()) slider_active_ = true;
+    ImGui::PopStyleVar(2);
+    ImGui::Dummy(ImVec2(0, D(4)));
+    return r;
+  }
+  bool Button(const char* label, bool enabled = true) {
+    ImGui::BeginDisabled(!enabled);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.11f, 0.13f, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.11f, 0.13f, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.75f, 0.15f, 0.18f, 1));
+    const bool r = ImGui::Button(label, ImVec2(-1, D(54))) && !drag_cancelled_;
+    ImGui::PopStyleColor(3);
+    ImGui::EndDisabled();
+    ImGui::Dummy(ImVec2(0, D(2)));
+    return r;
+  }
+
+  // ---------------------------------------------------------------- the pages
+  std::string GameName() const {
+    if (!s_.game_name.empty() && !game_from_usb_) return s_.game_name;
+    return U8(fs::u8path(read_path_).filename());
+  }
+
+  void GameFilesPage() {
+    GroupTitle("YOUR GAME");
+    if (game_ok_) {
+      ImGui::TextColored(kGood, "Ready: %s", GameName().c_str());
+      Note(game_from_usb_ ? "From the USB folder (below)." : "The file you chose. The app keeps permission to read it.");
+      Note(files_reader_.is_image() ? "Disc image (.iso)" : "Extracted game folder");
+    } else {
+      ImGui::TextColored(kBad, "%s", game_error_.empty() ? "No game files yet" : game_error_.c_str());
+    }
+    ImGui::Dummy(ImVec2(0, D(6)));
+    Note("Your own WWE 2K14 for Xbox 360, as a disc image (.iso). Nothing from the game comes with this app.");
+    ImGui::Dummy(ImVec2(0, D(6)));
+    if (Button("CHOOSE GAME FILE (.ISO)")) platform::PickGameFile();
+    if (!s_.game_uri.empty() && Button("FORGET THE CHOSEN FILE")) {
+      s_.game_uri.clear(), s_.game_name.clear();
+      Save();
+      RefreshGame();
+    }
+    GroupTitle("OR COPY IT OVER USB");
+    Note("Connect the phone to a PC and copy the .iso (or the extracted game folder's contents) into:");
+    ImGui::TextWrapped("Android/data/io.github.jarrodfeng.wwe2k14/files/game");
+    Note("A chosen file is used first; without one, the app looks in that folder.");
+    if (Button("LOOK AGAIN")) RefreshGame();
+  }
+
+  // Session 72 (Android drivers): the chosen driver must still be in the app (an update can drop one), and a trial
+  // file left from the last PLAY means the game never got going with it: back to the phone's own driver.
+  fs::path DriverTrialPath() const { return files_ / "driver_trial"; }
+  // Session 73: the custom driver of the last PLAY, until the player has said whether it looked right.
+  fs::path DriverAskPath() const { return files_ / "driver_ask"; }
+  std::string driver_ask_;  // asked on GRAPHICS: the game got going with it last time
+  bool DriverBundled(const std::string& file) const {
+    const fs::path dir = platform::NativeLibDir();
+    std::error_code ec;
+    return !dir.empty() && fs::is_regular_file(dir / file, ec);
+  }
+  std::string DriverName(const std::string& id) const {
+    for (const auto& d : kDrivers)
+      if (id == d.file) return d.name;
+    if (const UserDriver* u = FindUserDriver(id)) return u->name;
+    return "the custom driver";
+  }
+
+  // Part 8 (a player: "upload their own drivers from their storage"): the drivers the player imported, one folder each
+  // under platform::DriversDir() with the wwe2k14_driver.json DriverImport.java writes.
+  struct UserDriver {
+    std::string folder, name, library, description, version, author;
+  };
+  void ScanDrivers() {
+    user_drivers_.clear();
+    std::error_code ec;
+    const fs::path root = platform::DriversDir();
+    if (root.empty()) return;
+    for (const auto& e : fs::directory_iterator(root, ec)) {
+      const std::string folder = U8(e.path().filename());
+      if (!e.is_directory(ec) || folder.empty() || folder[0] == '.') continue;
+      UserDriver d;
+      d.folder = folder;
+      try {
+        std::ifstream f(e.path() / "wwe2k14_driver.json", std::ios::binary);
+        if (!f) continue;
+        const nlohmann::json j = nlohmann::json::parse(f);
+        Get(j, "name", d.name), Get(j, "library", d.library), Get(j, "description", d.description);
+        Get(j, "version", d.version), Get(j, "author", d.author);
+      } catch (...) {
+        continue;
+      }
+      if (d.library.empty() || !fs::is_regular_file(e.path() / fs::u8path(d.library), ec)) continue;
+      if (d.name.empty()) d.name = d.folder;
+      user_drivers_.push_back(std::move(d));
+    }
+    std::sort(user_drivers_.begin(), user_drivers_.end(),
+              [](const UserDriver& a, const UserDriver& b) { return a.folder < b.folder; });
+  }
+  const UserDriver* FindUserDriver(const std::string& id) const {
+    if (id.rfind(kUserDriverPrefix, 0) != 0) return nullptr;
+    const std::string folder = id.substr(std::string(kUserDriverPrefix).size());
+    for (const auto& d : user_drivers_)
+      if (d.folder == folder) return &d;
+    return nullptr;
+  }
+  void RemoveUserDriver(const UserDriver& d) {
+    const std::string name = d.name, id = kUserDriverPrefix + d.folder;
+    std::error_code ec;
+    fs::remove_all(platform::DriversDir() / fs::u8path(d.folder), ec);
+    Log("driver: removed %s (%s)%s", d.folder.c_str(), name.c_str(), ec ? (" - " + ec.message()).c_str() : "");
+    if (s_.driver == id) s_.driver.clear(), Save();
+    ScanDrivers();
+    ShowToast(ec ? "Could not remove " + name : "Removed " + name);
+  }
+  void CheckDriver() {
+    std::error_code ec;
+    const bool trial_left = fs::exists(DriverTrialPath(), ec);
+    if (fs::exists(DriverAskPath(), ec)) {
+      std::string id;
+      std::getline(std::ifstream(DriverAskPath()), id);
+      fs::remove(DriverAskPath(), ec);
+      if (!trial_left && id == s_.driver && !IdListHas(s_.drivers_ok, id) && !IdListHas(s_.drivers_bad, id)) {
+        driver_ask_ = id;
+        Log("driver: asking whether %s looked right", id.c_str());
+      }
+    }
+    if (trial_left) {
+      fs::remove(DriverTrialPath(), ec);
+      if (!s_.driver.empty()) {
+        Log("driver: %s did not get the game running last time: back to the phone's driver", s_.driver.c_str());
+        ShowToast(std::string(DriverName(s_.driver)) + " did not start the game: back to your phone's own driver");
+        s_.driver.clear();
+        Save();
+      }
+    }
+    const bool user = s_.driver.rfind(kUserDriverPrefix, 0) == 0;
+    if (!s_.driver.empty() && (user ? !FindUserDriver(s_.driver) : !DriverBundled(s_.driver))) {
+      Log("driver: %s is not in this app: the phone's driver", s_.driver.c_str());
+      s_.driver.clear();
+      Save();
+    }
+  }
+
+  void GraphicsPage() {
+    if (!driver_ask_.empty()) {  // Session 73 (idea 10)
+      GroupTitle("YOUR LAST GAME");
+      Note(("Did the game look right with " + DriverName(driver_ask_) +
+            "? White or missing textures, wrong colours or broken models mean this driver draws wrongly on this phone.")
+               .c_str());
+      if (Button("YES, IT LOOKED RIGHT")) {
+        IdListAdd(s_.drivers_ok, driver_ask_);
+        Log("driver: %s looked right (the player)", driver_ask_.c_str());
+        driver_ask_.clear();
+        Save();
+      }
+      if (Button("NO, IT LOOKED BROKEN")) {
+        IdListAdd(s_.drivers_bad, driver_ask_);
+        Log("driver: %s looked broken (the player): back to the phone's driver", driver_ask_.c_str());
+        ShowToast(DriverName(driver_ask_) + " is marked as drawing wrongly here: back to your phone's own driver", 8000);
+        if (s_.driver == driver_ask_) s_.driver.clear();
+        driver_ask_.clear();
+        Save();
+      }
+    }
+    // Session 94 (Jarrod's redesign): two columns in both orientations, no subheading text under the options. The groups
+    // come in ROWS of pairs that start at the same height (a table row each, as tall as the taller block); every block
+    // sits on its own lighter panel with a clear gutter of page background between the two columns.
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(D(8), 0));
+    title_underline_ = true;
+    int pair_id = 0;
+    // One pair: draw(left) then draw(right); `first` / `second` are lambdas filling their cell.
+    auto Pair = [&](auto&& left, auto&& right) {
+      ImGui::PushID(pair_id++);
+      const ImVec2 top = ImGui::GetCursorScreenPos();
+      const float full_w = ImGui::GetContentRegionAvail().x;
+      if (ImGui::BeginTable("##pair", 3, ImGuiTableFlags_NoSavedSettings | ImGuiTableFlags_PadOuterX)) {
+        ImGui::TableSetupColumn("l", ImGuiTableColumnFlags_WidthStretch, 1.f);
+        ImGui::TableSetupColumn("g", ImGuiTableColumnFlags_WidthFixed, D(8));
+        ImGui::TableSetupColumn("r", ImGuiTableColumnFlags_WidthStretch, 1.f);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        left();
+        ImGui::Dummy(ImVec2(1, D(8)));
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TableSetColumnIndex(2);
+        right();
+        ImGui::Dummy(ImVec2(1, D(8)));
+        ImGui::EndTable();
+      }
+      ImGui::PopID();
+      {  // a 2 px divider centred in the gutter, fading out over the top and bottom 15% of the pair's height
+        const float y0 = top.y, y1 = ImGui::GetCursorScreenPos().y, fade = (y1 - y0) * 0.15f;
+        const float cx = top.x + full_w / 2, hw = D(1);
+        const ImU32 solid = IM_COL32(70, 72, 80, 255), clear = IM_COL32(70, 72, 80, 0);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilledMultiColor(ImVec2(cx - hw, y0), ImVec2(cx + hw, y0 + fade), clear, clear, solid, solid);
+        dl->AddRectFilled(ImVec2(cx - hw, y0 + fade), ImVec2(cx + hw, y1 - fade), solid);
+        dl->AddRectFilledMultiColor(ImVec2(cx - hw, y1 - fade), ImVec2(cx + hw, y1), solid, solid, clear, clear);
+      }
+      ImGui::Dummy(ImVec2(1, D(12)));
+    };
+    Pair(
+        [&] {
+          GroupTitle("QUALITY");  // Session 93: AUTO / LOW / STANDARD
+          if (Choice("AUTO  (default)", s_.quality_tier == 0)) LeaveLow(0);
+          if (Choice("LOW", s_.quality_tier == 1, "Sets the crowd density to 70% once if it was at 100%; your sliders win after that.")) {
+            if (s_.quality_tier != 1) {  // Session 95: only on the way into LOW; the crowd it moved is given back on the way out if untouched
+              low_prev_crowd_ = s_.crowd_density;
+              if (ApplyLowStart(s_)) Log("settings: LOW chosen: crowd 100->70");
+              else low_prev_crowd_ = -1;
+            }
+            s_.quality_tier = 1;
+            Save();
+          }
+          if (Choice("STANDARD", s_.quality_tier == 2)) LeaveLow(2);
+        },
+        [&] {
+          GroupTitle("RESOLUTION");
+          for (int i = 0; i < kResolutionCount; ++i) {
+            const std::string label = std::string(kResolutions[i].name) + (i == kDefaultResolution ? "  (default)" : "") +
+                                      (kResolutions[i].resolution == 1 ? "  (heavy)" : "");
+            if (Choice(label.c_str(), s_.resolution == i)) s_.resolution = i, Save();
+          }
+        });
+    Pair(
+        [&] {
+          GroupTitle("FRAME RATE");
+          for (const auto& f : kFrameRates)
+            if (Choice(f.name, s_.frame_rate == f.value, f.note)) s_.frame_rate = f.value, Save();
+        },
+        [&] {
+          GroupTitle("UPSCALING");
+          if (Toggle("SGSR Upscaling", s_.sgsr)) Save();
+        });
+    Pair(
+        [&] {
+          GroupTitle("SCREEN SHAPE");
+          if (Choice("16:9", s_.aspect == 0)) s_.aspect = 0, Save();
+          if (Choice("FILL THE SCREEN", s_.aspect == 1, "Still experimental and prone to visual glitches. Menus stay 16:9."))
+            s_.aspect = 1, Save();
+        },
+        [&] {
+          // Session 85: the PC launcher's SHADOWS, DEPTH OF FIELD and CROWD DENSITY (Jarrod's order).
+          GroupTitle("EFFECTS");
+          if (Toggle("Shadows", s_.shadows)) Save();
+          if (Toggle("Depth of field", s_.depth_of_field)) Save();
+          if (Toggle("Film grain (30 Years)", s_.film_grain)) Save();  // Session 100 settings parity S3
+          if (Slider("Crowd density", s_.crowd_density, 0, 100, "%d%%")) {
+            s_.crowd_density = (std::clamp(s_.crowd_density, 0, 100) + 5) / 10 * 10;
+            Save();
+          }
+          Note("100% is the normal look; 0% is an empty arena. Takes effect when the game starts.");
+        });
+    Pair(
+        [&] {
+          GroupTitle("LANGUAGE");
+          for (const auto& l : kLanguages)
+            if (Choice(l.name, s_.language == l.id)) s_.language = l.id, Save();
+        },
+        [&] {
+          // Session 90 (Jarrod): the PC launcher's Advanced TRUE NATIVE, on the phone too. S101 (Jarrod, 2026-11-13: "yes hide true
+          // native"): hidden; owner mode draws everything, the setting stays on (mobile_settings.h forces it on load).
+          GroupTitle("TEXTURE FILTERING");
+          static constexpr const char* kFilters[] = {"STANDARD", "8X", "16X"};
+          ImGui::PushID("tf");
+          for (int i = 0; i < 3; ++i)
+            if (Choice(kFilters[i], s_.texture_filter == i)) s_.texture_filter = i, Save();
+          ImGui::PopID();
+        });
+    ImGui::PopStyleVar();
+    GroupTitle("GRAPHICS DRIVER");
+    if (Choice("YOUR PHONE'S OWN DRIVER  (default)", s_.driver.empty())) s_.driver.clear(), Save();
+    for (size_t i = 0; i < std::size(kDrivers); ++i) {
+      const auto& d = kDrivers[i];
+      if (i >= driver_bundled_.size() || !driver_bundled_[i]) continue;
+      if (Choice(d.name, s_.driver == d.file)) s_.driver = d.file, Save();
+      Note(d.note);
+      if (IdListHas(s_.drivers_bad, d.file)) Note("You said it drew wrongly on this phone.");
+    }
+    // Part 8: the player's own drivers.
+    const UserDriver* remove = nullptr;
+    for (const auto& d : user_drivers_) {
+      const std::string id = kUserDriverPrefix + d.folder;
+      ImGui::PushID(d.folder.c_str());
+      if (Choice((d.name + "  (yours)").c_str(), s_.driver == id)) s_.driver = id, Save();
+      std::string about = d.description;
+      if (!d.version.empty()) about += (about.empty() ? "" : " ") + std::string("(") + d.version + ")";
+      if (!d.author.empty()) about += (about.empty() ? "By " : ". By ") + d.author;
+      Note(((about.empty() ? std::string() : about + ". ") + "You added this one; it is not tested by the project.").c_str());
+      if (s_.driver == id && Button("REMOVE THIS DRIVER")) remove = &d;
+      ImGui::PopID();
+    }
+    if (remove) RemoveUserDriver(*remove);
+    if (Button("ADD YOUR OWN DRIVER (.ZIP OR .SO)")) platform::ImportDriver(platform::DriversDir());
+    Note("A driver package as Android emulators' driver managers use them (a .zip with the driver and its meta.json), "
+         "or the driver's .so on its own, for 64-bit ARM. It is copied into the app.");
+    Note("Try another driver if the picture is wrong or slow. One that does not suit your phone is skipped "
+         "(the game uses your phone's own driver), and if the game does not start with it, the launcher goes back "
+         "to your phone's own driver next time.");
+    title_underline_ = false;
+  }
+
+  void TouchPage() {
+    GroupTitle("SHOW TOUCH CONTROLS");
+    static constexpr const char* kModes[] = {"AUTOMATIC (hidden with a controller)", "ALWAYS", "OFF"};
+    for (int i = 0; i < 3; ++i)
+      if (Choice(kModes[i], s_.touch_mode == i)) s_.touch_mode = i, Save();
+    GroupTitle("LOOK AND FEEL");
+    if (Slider("Size", s_.touch_size, 60, 150, "%d%%")) Save();
+    if (Slider("Opacity", s_.touch_opacity, 20, 100, "%d%%")) Save();
+    if (Toggle("Vibrate on press", s_.touch_vibrate, "A short buzz for each button")) Save();
+    // Session 74 (players asked for it): drag the controls to new places (TouchEditActivity saves the file; in a game,
+    // Back -> MOVE TOUCH CONTROLS does the same).
+    GroupTitle("POSITIONS");
+    if (Button("MOVE THE CONTROLS")) platform::EditTouchLayout(s_.touch_size, s_.touch_opacity);
+    std::error_code ec;
+    const fs::path layout = files_ / "touch_layout.txt";
+    if (fs::exists(layout, ec) && Button("PUT THE CONTROLS BACK")) fs::remove(layout, ec);
+    Note("Drag a control to where your thumb wants it (A B X Y move together), then DONE. In a game, Back opens the "
+         "same editor (MOVE TOUCH CONTROLS).");
+    Note("An Xbox layout drawn over the game: sticks, d-pad, A B X Y, bumpers, triggers, stick clicks, and Start / "
+         "View at the top centre. A connected controller hides it (automatic).");
+  }
+
+  void ScanDlc() {
+    dlc_scanned_ = true;
+    packs_ = wwe2k14::dlc::Scan(DlcDir());
+    pack_names_.clear();
+    std::map<int, std::string> names;
+    for (const auto& p : packs_) {
+      if (p.status != wwe2k14::dlc::Status::kReady || p.string_pack.empty()) continue;
+      try {
+        for (const auto& [id, n] : wwe2k14::dlc::NamesFromPack(p)) names.emplace(id, n);
+      } catch (...) {
+      }
+    }
+    for (const auto& p : packs_) {
+      std::string list;
+      for (int id : p.char_ids) {
+        const auto n = names.find(60000 + id);
+        const std::string name = n != names.end() && !n->second.empty() ? wwe2k14::dlc::ReadableName(n->second)
+                                                                        : "#" + std::to_string(id);
+        list += (list.empty() ? "" : ", ") + name;
+      }
+      pack_names_.push_back(list);
+    }
+    Log("dlc: %zu packs in %s", packs_.size(), U8(DlcDir()).c_str());
+  }
+
+  void DlcPage() {
+    GroupTitle("DOWNLOADABLE CONTENT");
+    if (Toggle("Use DLC", s_.dlc, "Packs below load with the game")) Save();
+    if (Button("ADD DLC FILES")) platform::AddDlc(DlcDir());
+    Note("Pick the packs as they sit on the console's drive (copied with FATXplorer, for example). They are copied "
+         "into the app. Over USB, put them in Android/data/io.github.jarrodfeng.wwe2k14/files/dlc.");
+    if (Button("LOOK AGAIN")) ScanDlc();
+    GroupTitle("PACKS");
+    if (packs_.empty()) Note("No packs yet.");
+    std::vector<int> off = ParseIds(s_.dlc_off);
+    for (size_t i = 0; i < packs_.size(); ++i) {
+      const auto& p = packs_[i];
+      const bool ready = p.status == wwe2k14::dlc::Status::kReady;
+      bool on = ready && std::find(off.begin(), off.end(), p.pack_id) == off.end();
+      const std::string title = (p.package && !p.package_name.empty() ? p.package_name : p.folder) +
+                                (p.pack_id >= 0 ? "  (pack " + std::to_string(p.pack_id) + ")" : "");
+      const std::string note = ready ? (pack_names_[i].empty() ? std::string("ready") : pack_names_[i])
+                                     : std::string(wwe2k14::dlc::StatusName(p.status)) + ": " + p.reason;
+      ImGui::PushID(int(i));
+      ImGui::BeginDisabled(!ready || !s_.dlc);
+      if (Toggle(title.c_str(), on, note.c_str()) && ready) {
+        if (on) off.erase(std::remove(off.begin(), off.end(), p.pack_id), off.end());
+        else off.push_back(p.pack_id);
+        s_.dlc_off = JoinIds(off);
+        Save();
+      }
+      ImGui::EndDisabled();
+      ImGui::PopID();
+    }
+  }
+
+  // Session 98 (Arena Viewer phone port, stage C): the PC launcher's MODS tab button. The viewer reads the same game files (and the
+  // DLC packs as the DLC page has them) in its own activity over this launcher; Back there comes back here.
+  void ModsPage() {
+    GroupTitle("ARENA VIEWER");
+    Note("Walk around the arenas and wrestlers of your own game files. One finger looks, two fingers move, pinch goes forward "
+         "or back, a tap picks a part. Landscape only; Back leaves it.");
+    if (Button("ARENA VIEWER", game_ok_ && !TronZipRunning())) StartViewer();
+    if (!game_ok_) Note("Choose your game files first.");
+    SuperstarsGroup();  // Session 98 (Superstar Importer)
+    MusicGroup();  // Lane 286 (custom music on the phone)
+    // Session 98 (first phone test: the viewer's VIDEOS panel said "No tron export found"): the PC launcher's Build previews, for the
+    // phone. The game runs once in its tron export mode (src\tron_export.h: pictures + MP4 videos) and comes back by itself.
+    GroupTitle("TRON PREVIEWS");
+    if (trons_running_) {  // Session 98: the export runs behind this launcher (TronExportService)
+      const TronsProgress& p = trons_prog_;
+      if (p.state == "running") {
+        ImGui::TextWrapped("Building now: %d / %d  %s%s%s", std::min(p.done + 1, p.total), p.total, p.phase.c_str(),
+                           p.phase.empty() ? "" : ": ", p.item.c_str());
+        ImGui::ProgressBar(p.Fraction(), ImVec2(-1, D(10)), "");
+        Note(p.Detail().c_str());
+      } else {
+        Note("Building now: the game is starting.");
+        ImGui::ProgressBar(0.f, ImVec2(-1, D(10)), "");
+      }
+      if (p.Stuck()) {  // Session 98 review: a game process that outlived its export (or a hung export) must not block PLAY forever
+        ImGui::PushStyleColor(ImGuiCol_Text, kBad);
+        ImGui::TextWrapped("The export has not moved for over 4 minutes.");
+        ImGui::PopStyleColor();
+        if (Button("STOP THE EXPORT")) {
+          Log("tron previews: STOP pressed (no progress since %.0f, state %s)", p.updated, p.state.c_str());
+          platform::KillGame();
+          trons_poll_ms_ = 0;  // (the next frame's poll sees the process gone and reports the run)
+        }
+        Note("Ends the game's process. What is made so far stays; build them again to finish.");
+        return;
+      }
+      Note("It keeps going in the background; the notification shows the progress. PLAY, the Arena Viewer and another build wait "
+           "until it is done.");
+      Button("BUILD TRON PREVIEWS", false);
+      return;
+    }
+    const int n = TronPreviewCount();
+    const int nv = TronVideoCount();
+    Note(n > 0 ? (std::to_string(n) + " titantron pictures and " + std::to_string(nv) +
+                  " videos made. The viewer plays them on the stage screens and shows them in ASSETS > VIDEOS." +
+                  (nv == 0 ? " No videos yet: build them again for moving screens." : "")).c_str()
+               : "The viewer's stage screens and its ASSETS > VIDEOS need the titantrons and stage movies. Your own game makes them, once.");
+    if (!trons_last_.empty()) Note(trons_last_.c_str());  // Session 98: the last run's result and where its time went
+    if (Button(n > 0 ? "BUILD TRON PREVIEWS AGAIN" : "BUILD TRON PREVIEWS", game_ok_ && !TronZipRunning())) StartTronExport();
+    Note(("The game starts, then decodes every titantron and stage movie into pictures and videos (several minutes, up to about 15). "
+          "Once the progress bar moves you can leave the app: a notification shows the progress, and this launcher comes back by "
+          "itself. Needs up to about " + std::to_string(kTronsNeedMb) + " MB of storage.").c_str());
+    TronZipImportUi();  // Session 98: IMPORT TRON PREVIEWS (ZIP), the PC launcher's EXPORT FOR PHONE
+  }
+
+  // ------------------------------------------------------------ Session 98: the tron previews (the PC launcher's Build previews)
+  fs::path TronsDir() const { return files_ / "trons"; }  // (the viewer's tron cache: viewer_main.cpp, <files>/trons on Android)
+  fs::path TronsPendingPath() const { return files_ / "trons_pending.txt"; }
+  // Session 98 (phone tron video): the PNGs (~110 MB on the PC) + the MP4s of every tron and stage movie at the phone's rate (0.2 bits per
+  // pixel per frame, src/tron_export.h: ~460 + ~300 MB, scaled from the PC's 691 MB of tron MP4s at 0.3) -> ~0.9 GB; 1 GB asked.
+  // An estimate, not measured on a phone.
+  static constexpr int kTronsNeedMb = 1000;
+  int TronPreviewCount() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - trons_checked_ < std::chrono::seconds(2) && trons_checked_.time_since_epoch().count() != 0) return trons_count_;
+    trons_checked_ = now, trons_count_ = 0, trons_videos_ = 0;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(TronsDir(), ec)) {
+      const std::string name = U8(e.path().filename());
+      if (name.empty() || !std::isdigit(static_cast<unsigned char>(name[0]))) continue;
+      if (name.size() > 4 && name.compare(name.size() - 4, 4, ".png") == 0) ++trons_count_;
+      if (name.size() > 4 && name.compare(name.size() - 4, 4, ".mp4") == 0) ++trons_videos_;  // NNN.mp4 / NNN.alpha.mp4
+    }
+    return trons_count_;
+  }
+  int TronVideoCount() {  // (counted by TronPreviewCount, called first)
+    TronPreviewCount();
+    return trons_videos_;
+  }
+  int trons_videos_ = 0;
+
+  // Session 98 (Jarrod: "needs a progress bar ... a background process with a notification"): the export's progress file
+  // (<trons>/progress.json, src/tron_export.h) and its timings (<trons>/timings.json). The export can run behind this launcher: the
+  // launcher opens over the game once the export proper has started (LauncherActivity), then follows it here (TronsPoll) and
+  // reports the run when the game's process has ended.
+  struct TronsProgress {
+    std::string state, phase, item, message;
+    int done = 0, total = 0, ok = 0;
+    double item_frame = 0, item_frames = 0, mb = 0, elapsed = -1, eta = -1;
+    double updated = 0;  // when the game last wrote the file (seconds since 1970)
+    // Review: the export writes about once a second; no word for 4 minutes while its process lives = stuck (STOP offered).
+    bool Stuck() const {
+      if (updated <= 0 || state == "starting" || state.empty()) return false;
+      const double now = double(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+      return now - updated > 240;
+    }
+    float Fraction() const {
+      if (total <= 0) return 0.f;
+      const double part = item_frames > 0 && done < total ? std::min(1.0, item_frame / item_frames) : 0.0;
+      return float(std::min(1.0, (done + part) / total));
+    }
+    std::string Detail() const {
+      char b[160];
+      std::snprintf(b, sizeof b, "%.0f MB written", mb);
+      std::string s = b;
+      if (eta >= 0) s += ", about " + std::to_string(std::max(1, int(eta / 60.0 + 0.5))) + " min left";
+      return s;
+    }
+  };
+  fs::path TronsProgressPath() const { return TronsDir() / "progress.json"; }
+  TronsProgress ReadTronsProgress() {
+    TronsProgress p;
+    try {
+      std::ifstream f(TronsProgressPath(), std::ios::binary);
+      if (!f) return p;
+      const nlohmann::json j = nlohmann::json::parse(f);
+      p.state = j.value("state", ""), p.phase = j.value("phase", ""), p.item = j.value("item", ""), p.message = j.value("message", "");
+      p.done = j.value("done", 0), p.total = j.value("total", 0), p.ok = j.value("ok", 0);
+      p.item_frame = j.value("item_frame", 0.0), p.item_frames = j.value("item_frames", 0.0);
+      p.mb = j.value("mb", 0.0), p.elapsed = j.value("elapsed_s", -1.0), p.eta = j.value("eta_s", -1.0);
+      p.updated = j.value("updated", 0.0);
+    } catch (...) {
+      // (caught mid-write is not possible - the file is renamed into place - but an old or broken file reads as empty)
+    }
+    return p;
+  }
+  // The last run's totals by phase from timings.json: "decode 4.2 min, encode 3.1 min, ..." (Jarrod's speed work starts from these).
+  std::string TronsTimingLine() {
+    try {
+      std::ifstream f(TronsDir() / "timings.json", std::ios::binary);
+      if (!f) return {};
+      const nlohmann::json j = nlohmann::json::parse(f);
+      const auto& t = j.at("totals");
+      auto min = [&](const char* key) { return t.value(key, 0.0) / 60000.0; };
+      char b[512];
+      std::snprintf(b, sizeof b,
+                    "Time by step%s: decode %.1f min, encode %.1f min, file writes %.1f min, conversion %.1f min, PNG %.1f min, "
+                    "open / read / close %.1f min, other %.1f min (%.1f min in all, %d items, %.0f MB).",
+                    j.value("complete", false) ? "" : " (run not finished)", min("decode_ms"), min("encode_ms"), min("mux_ms"),
+                    min("convert_ms"), min("png_ms"), min("open_ms") + min("read_ms") + min("close_ms"), min("other_ms"),
+                    min("wall_ms"), t.value("items", 0), t.value("bytes", 0.0) / 1048576.0);
+      return b;
+    } catch (...) {
+      return {};
+    }
+  }
+  // Once a second while an export runs behind the launcher.
+  void TronsPoll() {
+    if (!trons_running_) return;
+    const uint64_t now = SDL_GetTicks();
+    if (now - trons_poll_ms_ < 1000) return;
+    trons_poll_ms_ = now;
+    trons_prog_ = ReadTronsProgress();
+    if (platform::GameAlive()) return;
+    trons_running_ = false;
+    Log("tron previews: the game's process has ended (progress: %s, %d of %d)", trons_prog_.state.c_str(), trons_prog_.done,
+        trons_prog_.total);
+    ResumeAfterTrons();
+    if (!trons_toast_.empty()) ShowToast(trons_toast_, 10000);
+  }
+  // Session 98: nothing else starts the game (or the viewer) while an export runs behind the launcher.
+  bool TronsBlock(const char* what) {
+    if (TronZipRunning()) {  // Session 98 (review of the zip import): the previews are being replaced
+      Log("%s refused: a tron previews import is running", what);
+      ShowToast(std::string("The tron previews are being imported. ") + what + " works again when the import finishes.", 6000);
+      return true;
+    }
+    if (!trons_running_) return false;
+    Log("%s refused: the tron export is still running", what);
+    const std::string counts = trons_prog_.total > 0 ? " (" + std::to_string(trons_prog_.done) + " of " +
+                                                           std::to_string(trons_prog_.total) + " done)"
+                                                     : "";
+    ShowToast("Tron previews are still being built" + counts + ". " + what + " works again when they finish" +
+                  (trons_prog_.Stuck() ? " (it looks stuck: MODS > TRON PREVIEWS has STOP THE EXPORT)." : "."),
+              6000);
+    return true;
+  }
+  bool trons_running_ = false;
+  uint64_t trons_poll_ms_ = 0;
+  TronsProgress trons_prog_;
+  std::string trons_last_;  // the last finished run: its result + TronsTimingLine
+
+  void StartTronExport() {
+    if (TronsBlock("BUILD TRON PREVIEWS")) return;
+    StopPreview();
+    if (!game_ok_) {
+      GoPage(kGameFiles);
+      ShowToast("Choose your game files first");
+      return;
+    }
+    if (const std::string pages = check::PageSizeProblem(); !pages.empty()) {  // (the same refusals as PLAY)
+      Log("BUILD TRON PREVIEWS refused: %s", pages.c_str());
+      ShowToast(pages, 10000);
+      return;
+    }
+    if (const std::string cpu = check::CpuProblem(); !cpu.empty()) {
+      Log("BUILD TRON PREVIEWS refused: %s", cpu.c_str());
+      ShowToast(cpu, 12000);
+      return;
+    }
+    std::error_code ec;
+    fs::create_directories(TronsDir(), ec);
+    // Room for the pictures and videos (kTronsNeedMb; what is already there is written over, so it counts as room)
+    {
+      uint64_t have = 0;
+      for (const auto& e : fs::recursive_directory_iterator(TronsDir(), ec))
+        if (e.is_regular_file(ec)) have += e.file_size(ec);
+      const auto space = fs::space(files_, ec);
+      const uint64_t need = kTronsNeedMb * 1024ull * 1024ull;
+      if (!ec && space.available + have < need) {
+        const std::string why = "Not enough free storage for the tron previews: they need about " + std::to_string(kTronsNeedMb) +
+                                " MB, " + std::to_string((unsigned long long)((space.available + have) / (1024 * 1024))) + " MB free";
+        Log("BUILD TRON PREVIEWS refused: %s", why.c_str());
+        ShowToast(why, 10000);
+        return;
+      }
+    }
+    // A killed or crashed run must not leave the last run's index.json to report "ready" (ResumeAfterTrons)
+    fs::remove(TronsDir() / "index.json", ec);
+    // Session 98: a fresh progress file ("starting": LauncherActivity brings the game forward until the export proper runs) and no
+    // old timings to report as this run's.
+    fs::remove(TronsDir() / "timings.json", ec);
+    std::ofstream(TronsProgressPath(), std::ios::trunc) << "{\"state\": \"starting\"}\n";
+    trons_last_.clear();
+    // The Play's graphics arguments (the phone's own: the game must boot as it does for a Play), no match to jump into, no Safe Mode
+    // trial; sound off (the game is held still while it decodes).
+    std::vector<std::string> args = GameArgs(s_, MakeContext(-1));
+    args.push_back("--wwe2k14_tron_export=" + U8(TronsDir()));
+    args.push_back("--wwe2k14_tron_export_media_mp4=true");  // Session 98 (phone tron video): the stage movies as MP4 too (the PC's Build previews)
+    args.push_back("--audio_mute=true");
+    std::ofstream(TronsPendingPath(), std::ios::trunc) << "tron export " << kVersion << "\n";
+    Save();
+    std::string line;
+    for (const auto& a : args) line += " " + a;
+    Log("BUILD TRON PREVIEWS:%s", line.c_str());
+    platform::TouchChoice t;
+    t.mode = 2;  // (TouchOverlay.MODE_OFF: nothing to play)
+    platform::StartGame(args, address_, t);
+  }
+  // At the launcher's start: the tron export that was running has ended (or the game died). Not a player run (LadderStart).
+  void ResumeAfterTrons() {
+    std::error_code ec;
+    if (!fs::exists(TronsPendingPath(), ec)) {
+      if (trons_last_.empty()) trons_last_ = TronsTimingLine();  // Session 98: the last run's numbers on the MODS page
+      return;
+    }
+    // Session 98: the launcher opened over a running export (LauncherActivity): follow it (TronsPoll) instead of reporting it.
+    if (platform::GameAlive()) {
+      trons_running_ = true;
+      trons_ended_ = true;  // (the game run the black box describes is this export, not a player's run: LadderStart leaves it out)
+      trons_prog_ = ReadTronsProgress();
+      trons_poll_ms_ = SDL_GetTicks();
+      Log("tron previews: the export is still running (%s, %d of %d): following it", trons_prog_.state.c_str(), trons_prog_.done,
+          trons_prog_.total);
+      return;
+    }
+    fs::remove(TronsPendingPath(), ec);
+    trons_ended_ = true;
+    trons_checked_ = {};  // (count the files again: the export has just written them)
+    const int n = TronPreviewCount();
+    bool index = fs::exists(TronsDir() / "index.json", ec);
+    const TronsProgress p = ReadTronsProgress();
+    Log("tron previews: the export run ended: %d tron pictures, index.json %s, progress %s (%d of %d, %d ok)", n,
+        index ? "written" : "missing", p.state.c_str(), p.done, p.total, p.ok);
+    const std::string timing = TronsTimingLine();
+    if (!timing.empty()) Log("tron previews: %s", timing.c_str());
+    // (shown in Start together with the last run's own line: a crashed export must not lose either)
+    trons_toast_ = index && n > 0 ? "Tron previews ready: " + std::to_string(n) + " titantrons" +
+                                        (p.total > 0 ? " (" + std::to_string(p.ok) + " of " + std::to_string(p.total) + " items made)" : "")
+                                  : n > 0 ? "Tron previews: the run ended early (" + std::to_string(n) + " pictures so far" +
+                                                (p.total > 0 ? ", " + std::to_string(p.done) + " of " + std::to_string(p.total) + " items" : "") +
+                                                "): build them again to finish"
+                                          : std::string("Tron previews: none were made (see SHARE for the game's log)");
+    trons_last_ = "Last build: " + trons_toast_.substr(trons_toast_.find(':') + 2) + (timing.empty() ? "" : ". " + timing);
+  }
+  std::string trons_toast_;
+  bool trons_ended_ = false;
+  std::chrono::steady_clock::time_point trons_checked_{};
+  int trons_count_ = 0;
+
+  // ------------------------------------------------------------ Session 98: IMPORT TRON PREVIEWS (ZIP)
+  // Jarrod: "could we have it export a zip that the phone launcher takes in? ... the easiest way for people to get it from their PC
+  // games to their phone game". The PC launcher's Trons -> Export for phone... makes one zip (src/tron_zip.h); this takes it in:
+  // Android's picker, the zip read in place (/proc/self/fd/N), checked (manifest, names, sizes, free space), unpacked next to the
+  // old previews and swapped in only when complete (tron_zip::Import), on a thread with a progress bar.
+  struct TronZipJob {
+    tron_zip::Progress prog;
+    std::atomic<bool> done{false};
+    std::string err, name;  // (err written by the thread before `done`)
+    tron_zip::ImportResult result;
+  };
+  std::shared_ptr<TronZipJob> tronzip_;
+  bool TronZipRunning() const { return tronzip_ && !tronzip_->done; }
+  void TronZipImportUi() {
+    const bool running = TronZipRunning();
+    std::error_code ec;
+    const bool exporting = trons_running_ || fs::exists(TronsPendingPath(), ec);
+    if (Button("IMPORT TRON PREVIEWS (ZIP)", !running && !exporting)) platform::PickTronZip();
+    if (running) {
+      const uint64_t t = tronzip_->prog.total, d = tronzip_->prog.done;
+      ImGui::ProgressBar(t ? float(double(d) / double(t)) : 0.f, ImVec2(-1, D(10)), "");
+      Note(t ? ("Importing " + tronzip_->name + ": " + std::to_string(d >> 20) + " of " + std::to_string(t >> 20) + " MB").c_str()
+             : ("Checking " + tronzip_->name + "...").c_str());
+    } else {
+      Note("Already built them on your PC? In the PC launcher's MODS > TRONS, press Export for phone..., copy the zip to this "
+           "phone and pick it here: no need to build them again. It replaces the previews above.");
+    }
+  }
+  void StartTronZipImport(const std::string& address, const std::string& name) {
+    if (TronZipRunning()) return;
+    std::error_code ec;
+    if (trons_running_ || fs::exists(TronsPendingPath(), ec)) {
+      ShowToast("The tron previews are being built: import the zip when that has finished.", 6000);
+      return;
+    }
+    const std::string path = platform::OpenPickedZip(address);
+    if (path.empty()) {
+      Log("IMPORT TRON PREVIEWS: %s cannot be read in place", address.c_str());
+      ShowToast("That zip cannot be read here. Copy it to the phone's own storage (Download, for example) and pick it from there.", 10000);
+      return;
+    }
+    auto job = std::make_shared<TronZipJob>();
+    job->name = name.empty() ? std::string("the zip") : name;
+    tronzip_ = job;
+    Log("IMPORT TRON PREVIEWS: %s (%s)", job->name.c_str(), address.c_str());
+    std::thread([job, path, dir = TronsDir()] { wwe2k14::NameThread(L"mob_trons");
+      try {
+        job->err = tron_zip::Import(path, dir, job->result, &job->prog);
+      } catch (const std::exception& e) {
+        job->err = std::string("the import stopped: ") + e.what();
+      } catch (...) {
+        job->err = "the import stopped";
+      }
+      job->done = true;
+    }).detach();
+  }
+  // Each frame: an import that has ended gets its note once.
+  void PollTronZipImport() {
+    if (!tronzip_ || !tronzip_->done || tronzip_reported_ == tronzip_.get()) return;
+    tronzip_reported_ = tronzip_.get();
+    platform::ClosePickedZip();
+    trons_checked_ = {};  // (counted again)
+    const auto& r = tronzip_->result;
+    if (!tronzip_->err.empty()) {
+      Log("IMPORT TRON PREVIEWS failed: %s", tronzip_->err.c_str());
+      ShowToast("Tron previews not imported: " + tronzip_->err, 10000);
+      return;
+    }
+    Log("IMPORT TRON PREVIEWS: %d files (%d videos, %d pictures, %llu bytes) from %s made %s; %d other files skipped", r.counts.files,
+        r.counts.videos, r.counts.pictures, (unsigned long long)r.counts.bytes, r.source.c_str(), r.created.c_str(), r.skipped);
+    const std::string from = r.source == "pc" ? "your PC" : r.source == "phone" ? "another phone" : "the zip";
+    ShowToast("Imported " + std::to_string(r.counts.videos) + " videos from " + from + " (" + std::to_string(r.counts.pictures) +
+                  " pictures)",
+              8000);
+  }
+  const void* tronzip_reported_ = nullptr;
+  // Session 98 (Superstar Importer; Jarrod: "as simple as an on and off switch, similar to our custom music and Trons" and "a table
+  // that lists the superstars added"): USE MY SUPERSTARS, the importer (the viewer's --importer mode in ViewerActivity), and the pack's
+  // list (<files>/mods/superstars, the importer core's LoadPack) with EDIT / REMOVE per superstar. The importer's own ON / OFF switch is
+  // this setting (it edits the "superstars" key of this launcher's settings file; the key is read back here once a second).
+  importer::PackState stars_;
+  std::string stars_err_;
+  std::chrono::steady_clock::time_point stars_checked_{};
+  int stars_sel_ = -1;
+  bool stars_confirm_ = false;
+  std::string ModsDir() const { return U8(files_ / "mods"); }
+  std::string stars_sig_;
+  // ---- Session 101 (lane 199, Jarrod: "as simple as possible to add characters"): the imported superstars before PLAY, the PC
+  // launcher's rule (launcher_main.cpp StarsBeforeStart): with USE MY SUPERSTARS on, the pack is checked against the DLC this PLAY gives
+  // the game (MakeContext / GameArgs: USE MY DLC + <files>/dlc + the switched-off packs) by the game's own rule (src\importer\
+  // pack_fit.h); when the list changed, was never built or no longer fits, it is rebuilt here first, then the game starts.
+  importer::PlayCheck stars_fit_;
+  std::string stars_fit_key_, stars_last_;
+  std::chrono::steady_clock::time_point stars_fit_at_{};
+  struct StarsJob {
+    std::atomic<int> state{1};  // 1 building, 2 done, 3 failed
+    std::atomic<float> frac{0};
+    std::mutex m;
+    std::string phase, err;
+    std::vector<std::string> moves;  // (review S5b) slot moves, said to the player
+  };
+  std::shared_ptr<StarsJob> stars_job_;
+  int stars_wm30_ = -1;
+  std::string stars_why_, stars_fail_;
+  bool stars_card_ = false, stars_skip_once_ = false, stars_without_once_ = false;
+  std::string StarsDlcDir() const {  // (MakeContext + GameArgs: the folder only when USE MY DLC is on and it exists)
+    std::error_code ec;
+    return s_.dlc && fs::is_directory(DlcDir(), ec) ? U8(DlcDir()) : std::string();
+  }
+  std::string StarsDlcOff() const { return JoinIds(ParseIds(s_.dlc_off)); }
+  // true = this PLAY waits for the build (PollStars plays when it is done)
+  bool StarsBeforePlay(int wm30) {
+    std::error_code ec;
+    if (!s_.superstars || !fs::is_directory(files_ / "mods" / "superstars", ec)) return false;  // (MakeContext: no folder = no flag)
+    const importer::PlayCheck c = importer::CheckBeforePlay(ModsDir(), StarsDlcDir(), StarsDlcOff());
+    if (!c.build) return false;
+    importer::PackState st;
+    std::string err;
+    if (!importer::LoadPack(ModsDir(), st, err)) return false;
+    Log("superstars: %s Building the pack before PLAY (%zu superstar(s))", c.why.c_str(), st.stars.size());
+    stars_wm30_ = wm30, stars_why_ = c.why, stars_fail_.clear(), stars_card_ = true;
+    auto j = stars_job_ = std::make_shared<StarsJob>();
+    const std::string mods = ModsDir(), root = read_path_, dlc = StarsDlcDir(), off = StarsDlcOff();
+    std::thread([j, st, mods, root, dlc, off] { wwe2k14::NameThread(L"mob_import");
+      launcher::GameFiles g;
+      g.SetRoot(fs::u8path(root));
+      std::string e;
+      bool ok = false;
+      try {
+        ok = importer::BuildPack(mods, g, dlc, st, [j](float f, const char* phase) {
+          j->frac = f;
+          std::lock_guard<std::mutex> lk(j->m);
+          j->phase = phase ? phase : "";
+        }, e, off);
+      } catch (const std::exception& x) {
+        e = x.what();
+      }
+      std::vector<std::string> moves = ok ? importer::LastBuildMoves() : std::vector<std::string>();
+      std::lock_guard<std::mutex> lk(j->m);
+      j->err = e, j->moves = std::move(moves);
+      j->state = ok ? 2 : 3;
+    }).detach();  // (Busy() keeps the loop awake while it runs: review B1)
+    return true;
+  }
+  void PollStars() {  // once per frame
+    if (!stars_job_ || stars_job_->state == 1) return;
+    std::string err, moved;
+    {
+      std::lock_guard<std::mutex> lk(stars_job_->m);
+      err = stars_job_->err;
+      for (const std::string& m : stars_job_->moves) moved += (moved.empty() ? "" : " ") + m;
+    }
+    const bool ok = stars_job_->state == 2;
+    stars_job_.reset();
+    stars_sig_.clear(), stars_fit_key_.clear();
+    if (ok && !moved.empty()) Log("superstars: %s", moved.c_str()), ShowToast(moved, 10000);  // (review S5b)  // (the SUPERSTARS list and its sentence are read again)
+    if (!ok) {
+      stars_fail_ = err.empty() ? std::string("the build stopped") : err;
+      Log("superstars: the build failed: %s", stars_fail_.c_str());
+      return;  // (the card says so: PLAY WITHOUT THEM / CANCEL)
+    }
+    Log("superstars: the pack is built; PLAY goes on");
+    stars_card_ = false;
+    stars_skip_once_ = true;  // (never a second build for the same PLAY: the game's own verdict file reports anything left)
+    Play(stars_wm30_);
+    stars_skip_once_ = false;
+  }
+  std::string StarsSig() const {  // <mods>/superstars: file names, sizes, times (the PC launcher's rule)
+    std::string sig;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(files_ / "mods" / "superstars", ec)) {
+      std::error_code e2;
+      if (!e.is_regular_file(e2)) continue;
+      sig += U8(e.path().filename()) + ":" + std::to_string(fs::file_size(e.path(), e2)) + ":" +
+             std::to_string(static_cast<long long>(fs::last_write_time(e.path(), e2).time_since_epoch().count())) + ";";
+    }
+    return sig;
+  }
+  void SuperstarsGroup() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stars_checked_ > std::chrono::seconds(1)) {  // (importer review: the pack is read again only when its folder changed)
+      stars_checked_ = now;
+      const std::string sig = StarsSig();
+      if (sig != stars_sig_ || stars_sig_.empty()) {
+        stars_sig_ = sig.empty() ? std::string("-") : sig;
+        stars_err_.clear();
+        if (!importer::LoadPack(ModsDir(), stars_, stars_err_)) stars_ = importer::PackState();
+        if (stars_sel_ >= int(stars_.stars.size())) stars_sel_ = -1;
+      }
+    }
+    GroupTitle("SUPERSTARS");
+    Note("Community characters (.pac, or a .zip that holds them) added to the roster as new superstars (DOWNLOADED SUPERSTARS).");
+    if (Toggle("USE MY SUPERSTARS", s_.superstars, s_.superstars ? "On: your pack is in the game" : "Off: the game's own roster only")) Save(false);
+    const bool stars_free = !stars_job_;  // Session 101 (review S3): nothing edits the pack while a PLAY builds it
+    if (Button("IMPORT MANY", game_ok_ && !TronZipRunning() && stars_free)) StartViewer({"--importer", "--importer-bulk"});
+    char head[96];
+    std::snprintf(head, sizeof head, "%zu of up to %d superstars", stars_.stars.size(), importer::kMaxStars);
+    Note(head);
+    // Session 101 (lane 199): whether they are in the game, and the one thing to do when not (the PC launcher's sentences)
+    if (now - stars_fit_at_ > std::chrono::seconds(2)) {
+      stars_fit_at_ = now;
+      const std::string key = stars_sig_ + "|" + StarsDlcDir() + "|" + StarsDlcOff();
+      if (key != stars_fit_key_) {
+        stars_fit_key_ = key;
+        stars_fit_ = importer::CheckBeforePlay(ModsDir(), StarsDlcDir(), StarsDlcOff());
+        stars_last_ = stars_fit_.build ? std::string() : importer::LastGameProblem(ModsDir());
+      }
+    }
+    if (!stars_.stars.empty() && !s_.superstars) Note("USE MY SUPERSTARS is off: switch it on to put them in the game.");
+    else if (!stars_.stars.empty() && stars_fit_.build) Note((stars_fit_.why + " PLAY builds them into the game first.").c_str());
+    else if (!stars_.stars.empty() && !stars_last_.empty()) Note((stars_last_ + " Share a report if it happens again.").c_str());
+    else if (!stars_fit_.why.empty()) Note((stars_fit_.why + (stars_fit_.build && s_.superstars ? " PLAY takes it out first." : "")).c_str());
+    for (int i = 0; i < int(stars_.stars.size()); ++i) {
+      const importer::Superstar& x = stars_.stars[size_t(i)];
+      char label[160], note[160];
+      std::snprintf(label, sizeof label, "%d   %s", x.slot, x.name.c_str());
+      std::snprintf(note, sizeof note, "based on %s", assets::CharacterLabel(x.base_id).c_str());
+      ImGui::PushID(i);
+      if (Choice(label, stars_sel_ == i, note)) stars_sel_ = stars_sel_ == i ? -1 : i;
+      ImGui::PopID();
+      if (stars_sel_ == i) {
+        if (Button("EDIT IN THE IMPORTER", game_ok_ && stars_free)) StartViewer({"--importer", "--importer-edit", std::to_string(x.slot)});
+        if (!stars_confirm_) {
+          if (Button("REMOVE FROM THE PACK", stars_free)) stars_confirm_ = true;
+        } else {
+          Note("Remove him from the pack? Build the pack again in the importer to take him out of the game.");
+          if (Button("YES, REMOVE", stars_free)) {
+            importer::PackState st;
+            std::string err;
+            // (importer review: by slot, read fresh - the importer may have changed the list since)
+            const int slot = x.slot;
+            const bool read = importer::LoadPack(ModsDir(), st, err);
+            const auto it = std::find_if(st.stars.begin(), st.stars.end(), [slot](const importer::Superstar& y) { return y.slot == slot; });
+            if (read && it != st.stars.end()) {
+              st.stars.erase(it);
+              st.needs_build = true;
+              if (!importer::SavePack(ModsDir(), st, err)) ShowToast("Not removed: " + err, 5000);
+            } else ShowToast("Not removed: " + (err.empty() ? std::string("he is no longer in the pack") : err), 5000);
+            stars_sel_ = -1, stars_confirm_ = false, stars_checked_ = {}, stars_sig_.clear();
+            break;  // (the list changed under the loop)
+          }
+          if (Button("CANCEL")) stars_confirm_ = false;
+        }
+      }
+    }
+    if (!stars_err_.empty()) Note(stars_err_.c_str());
+  }
+  // ------------------------------------------------------------ Lane 286 (Jarrod, 2026-11-13: "custom music should come to Android as
+  // well"): the PC launcher's MUSIC tab for the phone. USE MY MUSIC; NEW SONGS (extra entries at the end of the game's MUSIC list in
+  // Create-an-Entrance: ADD SONGS through Android's file picker, RENAME in a text box, REMOVE); WRESTLERS' THEMES (replace one wrestler's
+  // own theme with a NEW SONG or a picked file). The files and rules are the PC's (music_mods.h).
+  //
+  // Lane 297 (Jarrod: "clean and functional", the PC launcher's look): the LIBRARY, <mods>/music/library/, the same folder and
+  // choices.txt as the in-game picker. A row per song: the album art (or a record drawn in code) with a PLAY button over it, title /
+  // artist / duration, loudness and the gain the importer applied. Every song goes through src\audio_import (decode, normalise to the
+  // game's loudness, tags + art): a file it refuses is refused with its sentence and nothing is added. The work runs on the model's
+  // worker thread (music_library.h); a row says "converting..." until it has answered. The preview plays the normalised copy through
+  // the SDL player of lane 286 (src\music_sdl_player.h) and starts ONLY from the play button, never on hover / focus.
+  fs::path MusicMods() const { return files_ / "mods"; }
+  std::vector<music::NewSong> songs_;
+  std::vector<char> songs_work_;  // 1 = not converted yet (queued once)
+  std::vector<char> songs_ready_;  // 1 = the importer has converted it (the game plays the cache copy)
+  std::chrono::steady_clock::time_point songs_checked_{};
+  int song_sel_ = -1;  // a NEW SONG's id
+  bool song_confirm_ = false, themes_open_ = false;
+  int theme_sel_ = -1;  // a character id
+  // lane 297
+  std::unique_ptr<musiclib::Library> mlib_;
+  musiclib::PreviewState preview_;
+  // (heap, never deleted: its worker thread is detached and holds 	his; a destructor could run under it at exit)
+  music_sdl::Player* preview_player_ = new music_sdl::Player([] { return 0.85f; });
+  int preview_seq_ = 0;  // the id of the preview that was last started (the player says which id it plays)
+  bool preview_seen_ = false;
+  uint64_t preview_started_ms_ = 0;
+  std::string lib_sel_;
+  bool lib_confirm_ = false;
+  std::map<std::string, Texture> thumbs_;  // album art by thumbnail path (a null texture = unreadable, not retried)
+  int thumb_loads_ = 0;
+  bool test_played_ = false;
+  int last_pending_ = 0;
+  bool lib_started_ = false;  // the launcher-start conversion of songs with no current cache copy has been queued
+  std::set<std::string> check_queued_;
+  std::chrono::steady_clock::time_point lib_checked_{};
+
+  musiclib::Library& Lib() {
+    if (!mlib_) mlib_ = std::make_unique<musiclib::Library>(MusicMods());
+    return *mlib_;
+  }
+  bool MusicHasContent() const {
+    std::error_code ec;
+    for (const fs::path& dir : {music::NewSongsDir(MusicMods()), musiclib::LibraryDir(MusicMods())})
+      for (const auto& e : fs::directory_iterator(dir, ec))
+        if (e.is_regular_file(ec) && music::IsSongFile(e.path())) return true;
+    return music::HasAnyTheme(MusicMods());
+  }
+  void RefreshSongs(bool force = false) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && songs_checked_.time_since_epoch().count() != 0 && now - songs_checked_ < std::chrono::seconds(2)) return;
+    songs_checked_ = now;
+    songs_ = music::ReadNewSongs(MusicMods());
+    songs_ready_.assign(songs_.size(), 0);
+    songs_work_.assign(songs_.size(), 0);
+    for (size_t i = 0; i < songs_.size(); ++i)
+      if (songs_[i].present)
+      {
+        const audio_import::Imported l = audio_import::Lookup(music::NewSongsDir(MusicMods()) / fs::u8path(songs_[i].file), musiclib::CacheDir(MusicMods()));
+        songs_ready_[i] = l.ok;
+        songs_work_[i] = !l.ok && l.err.empty();  // refused songs are not work: the importer has said no
+      }
+    // a new song with no current cache copy (cache version bump, dropped in by hand) converts NOW with the progress card, not in the game
+    {
+      std::vector<fs::path> todo;
+      for (size_t i = 0; i < songs_.size(); ++i)
+        if (songs_[i].present && songs_work_[i] && check_queued_.insert(songs_[i].file).second)
+          todo.push_back(music::NewSongsDir(MusicMods()) / fs::u8path(songs_[i].file));
+      if (!todo.empty()) Lib().Check(std::move(todo));
+    }
+    if (song_sel_ >= 0 && std::none_of(songs_.begin(), songs_.end(), [&](const music::NewSong& s) { return s.present && s.id == song_sel_; }))
+      song_sel_ = -1, song_confirm_ = false;
+  }
+  void RefreshLibrary(bool force = false) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && lib_checked_.time_since_epoch().count() != 0 && now - lib_checked_ < std::chrono::milliseconds(700)) return;
+    lib_checked_ = now;
+    Lib().Refresh();
+  }
+
+  // ---- every frame: what the worker has to say, the preview's state, the album-art budget
+  void PollMusic() {
+    thumb_loads_ = 0;
+    if (thumbs_.size() > 300) {  // before anything is drawn this frame: a texture is never destroyed under the draw list
+      for (auto& kv : thumbs_) kv.second.Reset();
+      thumbs_.clear();
+    }
+    if (!lib_started_ && !files_.empty() && s_.music && test_.page < 0) {  // launcher start: convert what has no current cache copy, before PLAY
+      lib_started_ = true;
+      RefreshLibrary(true);
+      RefreshSongs(true);
+    }
+    if (mlib_) {
+      const int pend = mlib_->Pending();  // a song finished: list it again at once
+      if (pend != last_pending_) last_pending_ = pend, lib_checked_ = {};
+      for (const musiclib::Message& m : mlib_->TakeMessages()) {
+        Log("music: %s", m.text.c_str());
+        ShowToast(m.text, 6000);
+        if (m.ok && !s_.music) s_.music = true, Save(false), ShowToast(m.text + ". USE MY MUSIC is now on.", 6000);
+        lib_checked_ = {}, songs_checked_ = {};
+      }
+    }
+    if (test_.music_play >= 0) {  // the PC picture sheets: song N drawn as playing, no sound
+      if (!test_played_ && mlib_ && mlib_->Pending() == 0) {
+        const auto v = mlib_->Entries();
+        if (size_t(test_.music_play) < v.size() && v[size_t(test_.music_play)].state == musiclib::State::kReady)
+          preview_.OnPlayButton(v[size_t(test_.music_play)].file), test_played_ = true;
+      }
+      return;
+    }
+    if (!preview_.playing().empty()) {
+      const int now_playing = preview_player_->Playing();
+      if (now_playing == preview_seq_) preview_seen_ = true;
+      else if (preview_seen_) preview_.OnEnded(), preview_seen_ = false;  // the song finished
+      else if (SDL_GetTicks() - preview_started_ms_ > 3000) {              // it never started
+        const std::string why = preview_player_->LastError();
+        preview_.OnEnded();
+        ShowToast(why.empty() ? "That song could not be played" : why, 5000);
+      }
+    }
+    if (page_ != kMods && !preview_.playing().empty()) StopPreview();  // (the sidebar and the other pages are silent)
+  }
+  // The PC test's shot waits until the library has answered (the worker thread is slower than the shot's few frames).
+ public:
+  void OnBackground() { StopPreview(); }  // the app went to the background (lane 297)
+  bool TestHold() const { return !test_.music_busy && mlib_ && mlib_->Pending() > 0; }
+  bool MusicBusy() const { return !preview_.playing().empty() || (mlib_ && mlib_->Pending() > 0); }
+ private:
+  // The conversion card: "Converting songs: song 2 of 5", the song's name, a bar, CANCEL. On every page while the worker has work, so
+  // ADD A SONG / PICK A FILE / GIVE HIM and the launcher-start conversion all show the same thing (and PLAY waits for it).
+  void MusicProgressCard(ImVec2 size) {
+    if (!mlib_) return;
+    musiclib::Library::Progress pr = mlib_->Snapshot();
+    if (test_.music_busy) {  // the PC picture sheet: a made-up state (song 3 of 5, 40 %), the conversion itself is too quick to catch
+      pr.active = true, pr.done = 2, pr.total = 5, pr.name = "Kingdom (Entrance Remix).m4a", pr.stage = "normalising", pr.frac = 0.4f;
+    }
+    if (!pr.active) return;
+    const float w = std::min(size.x - D(32), D(540));
+    ImGui::SetNextWindowPos(ImVec2(size.x / 2, safe_max_.y - D(16)), ImGuiCond_Always, ImVec2(0.5f, 1.f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.04f, 0.05f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.84f, 0.09f, 0.12f, 1));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, D(1.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, D(6));
+    ImGui::Begin("##musicprog", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+    char head[96];
+    std::snprintf(head, sizeof head, "Converting songs: song %d of %d", std::min(pr.done + 1, std::max(pr.total, 1)), std::max(pr.total, 1));
+    ImGui::TextUnformatted(head);
+    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+    ImGui::TextUnformatted(pr.name.empty() ? "..." : pr.name.c_str());
+    ImGui::PopStyleColor();
+    const ImVec2 b0 = ImGui::GetCursorScreenPos();
+    const float bw = ImGui::GetContentRegionAvail().x, bh = D(10);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(b0, ImVec2(b0.x + bw, b0.y + bh), IM_COL32(48, 49, 56, 255), D(5));
+    const float seg = pr.total > 0 ? bw / float(pr.total) : bw;
+    dl->AddRectFilled(b0, ImVec2(b0.x + seg * float(pr.done), b0.y + bh), kMenuRed, D(5));
+    // the song in progress: its fraction when the importer reports one, else a pulse (it has not said how far it is)
+    const float cur = pr.frac >= 0 ? pr.frac : 1.f;
+    const int pulse = pr.frac >= 0 ? 255 : int(150 + 90 * std::sin(double(SDL_GetTicks()) / 220.0));
+    dl->AddRectFilled(ImVec2(b0.x + seg * float(pr.done), b0.y), ImVec2(b0.x + seg * (float(pr.done) + cur), b0.y + bh), IM_COL32(235, 70, 70, pulse), D(5));
+    ImGui::Dummy(ImVec2(0, bh + D(4)));
+    if (!pr.stage.empty()) {
+      ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+      ImGui::Text("%s%s", pr.stage.c_str(), pr.frac >= 0 ? (" " + std::to_string(int(pr.frac * 100)) + "%").c_str() : "...");
+      ImGui::PopStyleColor();
+    }
+    if (ImGui::Button("CANCEL", ImVec2(D(130), D(44))) && !drag_cancelled_) mlib_->Cancel();
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+  }
+  bool MusicBlocked() const { return test_.music_busy || (mlib_ && mlib_->Busy()); }
+
+  void StopPreview() {
+    ApplyPreview(preview_.OnLeave(), nullptr);
+  }
+  void ApplyPreview(const musiclib::PreviewState::Act& a, const musiclib::Entry* e) {
+    using Do = musiclib::PreviewState::Do;
+    if (a.what == Do::kStart && e && e->state == musiclib::State::kReady) {
+      preview_player_->Post(++preview_seq_, e->meta.audio);
+      preview_seen_ = false, preview_started_ms_ = SDL_GetTicks();
+      Log("music: preview %s", e->file.c_str());
+    } else if (a.what == Do::kStop) {
+      preview_player_->Post(-1, {});
+      preview_seen_ = false;
+    }
+  }
+
+  // ---- album art: the importer's 256x256 PNG as a texture (two a frame, so a long list opens smoothly)
+  const Texture* Thumb(const fs::path& png) {
+    const std::string key = U8(png);
+    auto it = thumbs_.find(key);
+    if (it != thumbs_.end()) return it->second.tex ? &it->second : nullptr;
+    if (thumb_loads_ >= 2) return nullptr;
+    ++thumb_loads_;
+    Texture t;
+    std::ifstream in(png, std::ios::binary);
+    const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    int w = 0, h = 0, n = 0;
+    if (!bytes.empty())
+      if (unsigned char* px = stbi_load_from_memory(bytes.data(), int(bytes.size()), &w, &h, &n, 4)) {
+        t = MakeTexture(renderer_, std::vector<uint8_t>(px, px + size_t(w) * size_t(h) * 4), w, h);
+        stbi_image_free(px);
+      }
+    Texture& slot = thumbs_[key];
+    slot = t;
+    return slot.tex ? &slot : nullptr;
+  }
+  // No art: a generic record drawn in code (black disc, grooves, a red label), the PC launcher's.
+  void DrawRecord(ImDrawList* dl, ImVec2 a, float size, bool dim) {
+    const ImVec2 c(a.x + size / 2, a.y + size / 2);
+    const float r = size / 2;
+    const int al = dim ? 150 : 255;
+    dl->AddRectFilled(a, ImVec2(a.x + size, a.y + size), IM_COL32(36, 36, 44, 255), D(4));
+    dl->AddCircleFilled(c, r * 0.9f, IM_COL32(14, 14, 18, 255), 40);
+    for (float g = 0.45f; g < 0.88f; g += 0.12f) dl->AddCircle(c, r * g, IM_COL32(48, 48, 58, 255), 40, 1.0f);
+    dl->AddCircleFilled(c, r * 0.30f, IM_COL32(176, 52, 52, al), 24);
+    dl->AddCircleFilled(c, r * 0.06f, IM_COL32(20, 20, 24, 255), 12);
+  }
+  // The play button over a thumbnail: a dark disc with a white triangle; red with a white square while it plays.
+  void DrawPlayButton(ImDrawList* dl, ImVec2 c, float r, bool playing, bool held) {
+    dl->AddCircleFilled(c, r, playing ? kMenuRed : IM_COL32(0, 0, 0, held ? 235 : 170), 28);
+    dl->AddCircle(c, r, IM_COL32(255, 255, 255, 200), 28, D(1.5f));
+    if (playing) {
+      const float s = r * 0.42f;
+      dl->AddRectFilled(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s), IM_COL32_WHITE, D(1.5f));
+    } else {
+      const float s = r * 0.46f;
+      dl->AddTriangleFilled(ImVec2(c.x - s * 0.7f, c.y - s * 1.05f), ImVec2(c.x - s * 0.7f, c.y + s * 1.05f), ImVec2(c.x + s * 1.15f, c.y),
+                            IM_COL32_WHITE);
+    }
+  }
+  void DrawEqualiser(ImDrawList* dl, ImVec2 a, float w, float h) {
+    const double t = double(SDL_GetTicks()) / 1000.0;
+    const float bw = w / 5.f;
+    for (int i = 0; i < 3; ++i) {
+      const float k = 0.3f + 0.7f * float(0.5 + 0.5 * std::sin(t * (5.0 + 2.3 * i) + i * 1.7));
+      dl->AddRectFilled(ImVec2(a.x + i * 2 * bw, a.y + h * (1 - k)), ImVec2(a.x + i * 2 * bw + bw, a.y + h), kMenuRed);
+    }
+  }
+  static std::string Dots(uint64_t ms) { return std::string(size_t(1 + (ms / 350) % 3), '.'); }
+
+  // One library song. Tap the picture: play / stop its preview. Tap the rest of the row: its actions (USE THIS SONG, REMOVE).
+  void LibraryRow(const musiclib::Entry& e) {
+    using musiclib::State;
+    ImGui::PushID(e.file.c_str());
+    const float h = D(88), thumb = D(68), zone = D(88);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const bool ready = e.state == State::kReady, sel = lib_sel_ == e.file, playing = preview_.playing() == e.file;
+    ImGui::SetCursorScreenPos(p);
+    const bool can_play = e.previewable();
+    const bool play_tap = ImGui::InvisibleButton("##play", ImVec2(zone, h)) && !drag_cancelled_ && can_play;
+    const bool play_held = ImGui::IsItemActive() && !dragging_ && can_play;
+    ImGui::SetCursorScreenPos(ImVec2(p.x + zone, p.y));
+    const bool body_tap = ImGui::InvisibleButton("##body", ImVec2(std::max(D(40), w - zone), h)) && !drag_cancelled_;
+    const bool body_held = ImGui::IsItemActive() && !dragging_;
+    const bool body_focus = ImGui::IsItemFocused();
+    // The rule: hovering or focusing a row (pointer, keyboard, pad) NEVER plays anything; only the play button does.
+    if (ImGui::IsItemHovered() || body_focus) ApplyPreview(preview_.OnRowFocus(e.file), &e);
+    if (play_tap) ApplyPreview(preview_.OnPlayButton(e.file), &e);
+    if (body_tap) lib_sel_ = sel ? std::string() : e.file, lib_confirm_ = false;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 bg = body_held ? IM_COL32(120, 16, 22, 255) : sel ? IM_COL32(32, 8, 10, 235) : IM_COL32(30, 31, 37, 215);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), bg, D(3));
+    if (e.current && ready) dl->AddRectFilled(p, ImVec2(p.x + D(5), p.y + h), kMenuRed, D(3), ImDrawFlags_RoundCornersLeft);
+    if (body_focus) dl->AddRect(p, ImVec2(p.x + w, p.y + h), IM_COL32(255, 255, 255, 160), D(3), 0, D(1.5f));
+    // picture
+    const ImVec2 ta(p.x + D(12), p.y + (h - thumb) / 2);
+    const Texture* art = e.has_art() ? Thumb(e.meta.thumb) : nullptr;
+    if (art) {
+      dl->AddImage(art->Ref(), ta, ImVec2(ta.x + thumb, ta.y + thumb));
+      if (!ready) dl->AddRectFilled(ta, ImVec2(ta.x + thumb, ta.y + thumb), IM_COL32(0, 0, 0, 130));
+    } else DrawRecord(dl, ta, thumb, !ready);
+    const ImVec2 tc(ta.x + thumb / 2, ta.y + thumb / 2);
+    if (can_play) DrawPlayButton(dl, tc, D(19), playing, play_held);
+    else if (e.state == State::kRefused) {  // a red cross: this song cannot be played
+      const float s = D(11);
+      dl->AddCircleFilled(tc, D(19), IM_COL32(0, 0, 0, 190), 28);
+      dl->AddLine(ImVec2(tc.x - s * .6f, tc.y - s * .6f), ImVec2(tc.x + s * .6f, tc.y + s * .6f), IM_COL32(255, 110, 90, 255), D(2.5f));
+      dl->AddLine(ImVec2(tc.x - s * .6f, tc.y + s * .6f), ImVec2(tc.x + s * .6f, tc.y - s * .6f), IM_COL32(255, 110, 90, 255), D(2.5f));
+    } else {  // converting: a turning arc
+      const float a0 = float(SDL_GetTicks() % 1200) / 1200.f * 6.2832f;
+      dl->PathArcTo(tc, D(13), a0, a0 + 4.2f, 20);
+      dl->PathStroke(IM_COL32(255, 255, 255, 230), 0, D(3));
+    }
+    // text
+    const float tx = p.x + zone + D(12), tw = std::max(D(40), w - zone - D(12) - D(12));
+    dl->PushClipRect(ImVec2(tx, p.y), ImVec2(tx + tw, p.y + h), true);
+    const float line = ImGui::GetTextLineHeight();
+    const ImU32 dim = ImGui::GetColorU32(kDim);
+    ImFont* font = ImGui::GetFont();
+    const float fs1 = ImGui::GetFontSize();
+    float y = p.y + D(11);
+    dl->AddText(font, fs1, ImVec2(tx, y), IM_COL32_WHITE, e.title().c_str());
+    y += line + D(2);
+    if (ready) {
+      std::string by = musiclib::ByLine(e.meta);
+      by += (by.empty() ? "" : "   ") + musiclib::FormatTime(e.meta.seconds);
+      dl->AddText(font, fs1 * 0.86f, ImVec2(tx, y), dim, by.c_str());
+      y += line * 0.86f + D(5);
+      float x = tx;
+      if (e.current && ready) {
+        const char* tag = "CURRENT";
+        const ImVec2 ts = font->CalcTextSizeA(fs1 * 0.66f, FLT_MAX, 0, tag);
+        dl->AddRectFilled(ImVec2(x, y - D(1)), ImVec2(x + ts.x + D(12), y + ts.y + D(3)), kMenuRed, D(8));
+        dl->AddText(font, fs1 * 0.66f, ImVec2(x + D(6), y + D(1)), IM_COL32_WHITE, tag);
+        x += ts.x + D(20);
+      }
+      const std::string num = musiclib::LoudnessText(e.meta) + "  " + musiclib::GainText(e.meta);
+      dl->AddText(font, fs1 * 0.72f, ImVec2(x, y + D(1)), dim, (can_play ? num : std::string("plays as it is (no preview)")).c_str());
+    } else if (e.state == State::kConverting) {
+      dl->AddText(font, fs1 * 0.86f, ImVec2(tx, y), dim, ("converting" + Dots(SDL_GetTicks())).c_str());
+    } else {
+      dl->PopClipRect();  // (a refusal can be a sentence: it wraps instead of being cut)
+      dl->PushClipRect(ImVec2(tx, p.y), ImVec2(tx + tw, p.y + h), true);
+      dl->AddText(font, fs1 * 0.78f, ImVec2(tx, y), IM_COL32(255, 140, 115, 255), e.meta.err.c_str(), nullptr, tw);
+    }
+    dl->PopClipRect();
+    if (playing) DrawEqualiser(dl, ImVec2(p.x + w - D(30), p.y + h - D(34)), D(18), D(22));
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
+    ImGui::Dummy(ImVec2(0, D(4)));
+    ImGui::PopID();
+    if (!sel) return;
+    // the row's actions (their own ID scope: the NEW SONGS rows have buttons of the same names)
+    ImGui::PushID(e.file.c_str());
+    ImGui::PushID("actions");
+    const std::string shown = e.title();
+    if (ready && Button("USE THIS SONG AT MY ENTRANCES", !e.current)) {
+      const std::string err = Lib().SetCurrent(e.file);
+      Log("music: current song '%s': %s", e.file.c_str(), err.empty() ? "ok" : err.c_str());
+      ShowToast(err.empty() ? "Entrances now play: " + shown : "Not changed: " + err);
+      lib_checked_ = {};
+      if (err.empty() && !s_.music) s_.music = true, Save(false);
+    }
+    if (!lib_confirm_) {
+      if (Button("REMOVE FROM THE LIBRARY")) lib_confirm_ = true;
+    } else {
+      Note("Remove it? Your copy is deleted; the original file stays where it was.");
+      if (Button("YES, REMOVE")) {
+        ApplyPreview(preview_.OnRemoved(e.file), &e);
+        const std::string err = Lib().Remove(e.file);
+        Log("music: remove '%s': %s", e.file.c_str(), err.empty() ? "ok" : err.c_str());
+        ShowToast(err.empty() ? "Removed: " + shown : "Not removed: " + err);
+        lib_sel_.clear(), lib_confirm_ = false, lib_checked_ = {};
+        RefreshLibrary(true);
+      }
+      if (Button("CANCEL")) lib_confirm_ = false;
+    }
+    ImGui::PopID();
+    ImGui::PopID();
+  }
+
+  // GIVE HIM: the copy of the song to <mods>/music/<id>.<ext> runs on the worker (a song is megabytes), then the theme file is
+  // converted with the card (a cache hit for a song that is already converted).
+  void GiveTheme(int id, const std::string& who, const fs::path& src, const std::string& what) {
+    const fs::path mods = MusicMods();
+    std::string ext = U8(src.extension());
+    for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+    Lib().Task(
+        [mods, id, who, src, what] {
+          const std::string err = music::AssignTheme(mods, id, src);
+          if (!err.empty()) return musiclib::Message{false, "Not given: " + err};
+          return musiclib::Message{true, who + " now enters to " + what};
+        },
+        music::MusicDir(mods) / fs::u8path(std::to_string(id) + ext));  // converted afterwards (AssignTheme names the copy <id><ext>)
+  }
+  void MusicEvent(const platform::Event& e) {
+    using E = platform::Event;
+    if (e.kind == E::kSongsAdded) {
+      // e.b = what the picker was for: "@library" / "@new" (several files, the staging folder), or a character id (one theme file, in place)
+      Log("music: file(s) picked (%s): %s", e.b.c_str(), e.a.c_str());
+      if (!e.ok) {  // nothing was copied: the reason is the message (full phone, not a song file ...)
+        ShowToast(e.a.empty() ? "No song was added" : e.a, 6000);
+        return;
+      }
+      musiclib::Library& lib = Lib();
+      if (!e.b.empty() && e.b[0] != '@') {  // a wrestler's own theme: the picker put <id>.<ext> in place; the importer checks it
+        // lane 297b: the pick waits in the theme staging folder; the library installs it (and drops the earlier theme) only after it converts
+        std::error_code sec;
+        for (const auto& f : fs::directory_iterator(musiclib::StagingDir(MusicMods(), "theme"), sec))
+          if (f.is_regular_file(sec) && musiclib::U8(f.path().stem()) == e.b && audio_import::IsSupportedExt(f.path())) {
+            lib.InstallTheme(f.path(), e.b);
+            break;
+          }
+      } else if (e.b == "@new") {
+        lib.ImportIncoming(music::NewSongsDir(MusicMods()));
+      } else {
+        lib.ImportIncoming();
+      }
+      ShowToast(e.a, 4000);  // "2 song(s) added, 1 not a song file"; the card shows the conversion
+      lib_checked_ = {}, songs_checked_ = {};
+    } else if (e.kind == E::kTextEntered && e.ok && e.b.rfind("rename:", 0) == 0) {
+      const int id = std::atoi(e.b.c_str() + 7);
+      const std::string err = music::RenameNewSong(MusicMods(), id, e.a);
+      Log("music: rename %d -> '%s': %s", id, e.a.c_str(), err.empty() ? "ok" : err.c_str());
+      if (!err.empty()) ShowToast("Not renamed: " + err, 5000);
+      RefreshSongs(true);
+    }
+  }
+
+  void MusicGroup() {
+    RefreshSongs();
+    RefreshLibrary();
+    musiclib::Library& lib = Lib();
+    const fs::path mods = MusicMods();
+    GroupTitle("MUSIC");
+    Note("Your own songs at the entrances. Keep them in the LIBRARY below; every song is converted to the loudness of the game's own "
+         "music. Or give a song to one wrestler further down to replace his own theme.");
+    if (Toggle("USE MY MUSIC", s_.music, s_.music ? "On: your songs are in the game" : "Off: the game's own music only")) Save(false);
+    // ---- LIBRARY
+    GroupTitle("LIBRARY");
+    Note("Tap the picture of a song to hear it. Tap the rest of a row to use it at the entrances or remove it. The red-edged song is "
+         "the one the game plays.");
+    if (Button("ADD A SONG", !TronZipRunning() && !MusicBlocked())) {
+      platform::PickAudio(musiclib::StagingDir(mods, "library"), "@library");
+    }
+    Note("MP3, M4A, OGG, OPUS, FLAC, WAV, AAC or WMA. Your copy goes into the app's folder; the original stays where it was. A file that "
+         "is not playable audio is turned away with the reason.");
+    const std::vector<musiclib::Entry> songs = lib.Entries();
+    if (lib.Importing() > 0) {
+      char b[96];
+      std::snprintf(b, sizeof b, "Adding %d song(s)%s", lib.Importing(), Dots(SDL_GetTicks()).c_str());
+      ImGui::TextColored(kBad, "%s", b);
+    }
+    for (const musiclib::Entry& e : songs) {
+      // (rows far outside the screen are only space: no texture is read for them)
+      const float row_h = D(92);
+      const ImVec2 cp = ImGui::GetCursorScreenPos();
+      if (!ImGui::IsRectVisible(cp, ImVec2(cp.x + 10, cp.y + row_h))) {
+        ImGui::Dummy(ImVec2(1, row_h));
+        continue;
+      }
+      LibraryRow(e);
+    }
+    {
+      int ready = 0, bad = 0;
+      for (const musiclib::Entry& e : songs) ready += e.state == musiclib::State::kReady, bad += e.state == musiclib::State::kRefused;
+      char head[160];
+      if (songs.empty()) std::snprintf(head, sizeof head, "No songs yet: ADD A SONG.");
+      else std::snprintf(head, sizeof head, "%d song(s) in the library%s.", int(songs.size()), bad ? ", some cannot be played (remove them)" : "");
+      (void)ready;
+      Note(head);
+    }
+    // ---- NEW SONGS (the game's MUSIC list)
+    GroupTitle("NEW SONGS IN THE MUSIC LIST");
+    Note("Extra entries at the end of Create-an-Entrance's MUSIC list (the game's own menu is the picker). A wrestler keeps the one you "
+         "gave him.");
+    if (Button("ADD SONGS", !TronZipRunning() && !MusicBlocked())) {
+      platform::PickAudio(musiclib::StagingDir(mods, "new"), "@new");
+    }
+    // ---- NEW SONGS
+    int shown = 0, waiting = 0;
+    for (size_t i = 0; i < songs_.size(); ++i) {
+      const music::NewSong& sg = songs_[i];
+      if (!sg.present) continue;
+      ++shown;
+      const bool ready = songs_ready_[i] != 0;
+      waiting += ready ? 0 : 1;
+      char note[160];
+      std::snprintf(note, sizeof note, "%s  -  id %d  -  %s", sg.file.c_str(), sg.id, ready ? "ready" : "waiting to be converted");
+      ImGui::PushID(sg.id);
+      if (Choice(sg.name.c_str(), song_sel_ == sg.id, note)) song_sel_ = song_sel_ == sg.id ? -1 : sg.id, song_confirm_ = false;
+      ImGui::PopID();
+      if (song_sel_ == sg.id) {
+        ImGui::PushID(sg.id);
+        ImGui::PushID("newsong");
+        if (Button("RENAME")) platform::PromptText("Name in the game's MUSIC list", sg.name, "rename:" + std::to_string(sg.id));
+        if (!song_confirm_) {
+          if (Button("REMOVE THIS SONG")) song_confirm_ = true;
+        } else {
+          Note("Remove it? A wrestler who has it will have no entrance music until you pick another.");
+          if (Button("YES, REMOVE")) {
+            const std::string err = music::RemoveNewSong(mods, sg.file);
+            Log("music: remove '%s': %s", sg.file.c_str(), err.empty() ? "ok" : err.c_str());
+            ShowToast(err.empty() ? "Removed: " + sg.file : "Not removed: " + err);
+            song_sel_ = -1, song_confirm_ = false;
+            RefreshSongs(true);
+            ImGui::PopID();
+            ImGui::PopID();
+            break;  // (the list changed under the loop)
+          }
+          if (Button("CANCEL")) song_confirm_ = false;
+        }
+        ImGui::PopID();
+        ImGui::PopID();
+      }
+    }
+    char head[128];
+    std::snprintf(head, sizeof head, shown ? "%d new song(s)." : "No new songs yet: ADD SONGS.", shown);
+    Note(head);
+    if (waiting) Note("A song marked \"waiting to be converted\" is converted by this launcher (the bar at the bottom); the game never converts.");
+    // ---- WRESTLERS' THEMES
+    GroupTitle("WRESTLERS' THEMES");
+    Note("Replace one wrestler's own theme: yours plays at his entrance instead. Needs USE MY MUSIC on. Not heard in replays.");
+    if (Button(themes_open_ ? "HIDE THE WRESTLERS" : "SHOW THE WRESTLERS")) themes_open_ = !themes_open_;
+    if (!themes_open_) return;
+    for (const assets::IdName& c : assets::kCharacterNames) {
+      if (!*c.name) continue;
+      const fs::path th = music::ThemeFor(mods, c.id);
+      const std::string note = th.empty() ? std::string("original theme") : "yours: " + U8(th.filename());
+      ImGui::PushID(c.id);
+      if (Choice(c.name, theme_sel_ == c.id, note.c_str())) theme_sel_ = theme_sel_ == c.id ? -1 : c.id;
+      ImGui::PopID();
+      if (theme_sel_ != c.id) continue;
+      // a song from the LIBRARY, else one of the NEW SONGS
+      for (const musiclib::Entry& e : songs) {
+        if (e.state != musiclib::State::kReady) continue;
+        ImGui::PushID(e.file.c_str());
+        if (Choice(("GIVE HIM  " + e.title()).c_str(), false)) {
+          GiveTheme(c.id, c.name, e.path, e.title());
+        }
+        ImGui::PopID();
+      }
+      for (const music::NewSong& sg : songs_) {
+        if (!sg.present) continue;
+        ImGui::PushID(sg.id);
+        if (Choice(("GIVE HIM  " + sg.name).c_str(), false)) {
+          GiveTheme(c.id, c.name, music::NewSongsDir(mods) / fs::u8path(sg.file), sg.name);
+        }
+        ImGui::PopID();
+      }
+      if (Button("PICK A FILE...", !MusicBlocked())) {
+        platform::PickAudio(musiclib::StagingDir(mods, "theme"), std::to_string(c.id));
+      }
+      if (Button("ORIGINAL MUSIC", !th.empty())) {
+        music::RevertTheme(mods, c.id);
+        Log("music: theme of %d back to the original", c.id);
+        ShowToast(std::string(c.name) + ": the original theme");
+      }
+    }
+  }
+  void StartViewer(const std::vector<std::string>& more = {}) {
+    if (TronsBlock(more.empty() ? "The Arena Viewer" : "The Superstar Importer")) return;  // Session 98
+    StopPreview();  // lane 297: a song heard in the library does not play on into the viewer
+    std::vector<std::string> args = {"--game", address_.rfind("content://", 0) == 0 ? std::string(kGameFdToken) : read_path_};
+    for (const std::string& m : more) args.push_back(m);
+    if (!more.empty()) {  // Session 98 (Superstar Importer): its pack in <files>/mods, its switch in this launcher's settings file
+      Save();
+      args.push_back("--mods"), args.push_back(ModsDir());
+      args.push_back("--settings-file"), args.push_back(U8(SettingsPath()));
+    }
+    std::error_code ec;
+    if (!s_.dlc) args.push_back("--no-dlc");
+    else if (fs::is_directory(DlcDir(), ec)) {
+      args.push_back("--dlc"), args.push_back(U8(DlcDir()));
+      const std::string off = JoinIds(ParseIds(s_.dlc_off));
+      if (!off.empty()) args.push_back("--dlc-off"), args.push_back(off);
+    }
+    std::string line;
+    for (const auto& a : args) line += " " + a;
+    Log("ARENA VIEWER:%s", line.c_str());
+    platform::StartViewer(args, address_);
+  }
+
+  void Wm30Page() {
+    if (!game_ok_) {
+      Note("Choose your game files first: the list comes from them.");
+      return;
+    }
+    if (!wm30_.loaded) {
+      wm30_ = wwe2k14::wm30list::Load(files_reader_);
+      Log("30 years: %s (%zu matches)", wm30_.ok ? "ok" : wm30_.error.c_str(), wm30_.matches.size());
+    }
+    if (!wm30_.ok) {
+      ImGui::TextColored(kBad, "The list could not be read: %s", wm30_.error.c_str());
+      return;
+    }
+    Note("Pick a match, then PLAY THIS MATCH: the game goes straight to it.");
+    int era = -1;
+    for (size_t i = 0; i < wm30_.matches.size(); ++i) {
+      const auto& m = wm30_.matches[i];
+      if (m.era != era) {
+        era = m.era;
+        GroupTitle(m.era >= 0 && m.era < 5 && !wm30_.era_names[m.era].empty() ? wm30_.era_names[m.era].c_str() : "ERA");
+      }
+      ImVec2 p;
+      ImGui::PushID(int(i));
+      const float h = D(70);
+      if (Row("##m", h, wm30_pick_ == int(i), &p)) wm30_pick_ = int(i);
+      ImGui::PopID();
+      ImDrawList* dl = ImGui::GetWindowDrawList();
+      const float line = ImGui::GetTextLineHeight();
+      std::string people;
+      for (const auto& x : m.people) people += (people.empty() ? "" : " vs ") + x;
+      const std::string sub = m.show + (m.date.empty() ? "" : "  -  " + m.date);
+      ImGui::PushClipRect(p, ImVec2(p.x + ImGui::GetContentRegionAvail().x - D(8), p.y + h), true);
+      dl->AddText(ImVec2(p.x + D(18), p.y + h / 2 - line - D(1)), IM_COL32_WHITE, (m.title.empty() ? people : m.title).c_str());
+      dl->AddText(ImVec2(p.x + D(18), p.y + h / 2 + D(1)), ImGui::GetColorU32(kDim), sub.c_str());
+      ImGui::PopClipRect();
+    }
+  }
+  void Wm30Bar(ImVec2 pos, float w) {
+    const bool picked = wm30_pick_ >= 0 && wm30_pick_ < int(wm30_.matches.size());
+    if (SlantButton(picked ? "PLAY THIS MATCH" : "PICK A MATCH", ImVec2(pos.x + D(8), pos.y + D(10)),
+                    ImVec2(w - D(16), D(70)), picked && game_ok_ && !TronZipRunning(), D(36)) && picked)
+      Play(wm30_.matches[size_t(wm30_pick_)].index);
+  }
+
+  // The save folder's size, counted when the page opens and after an import (Session 72: it was counted every frame).
+  void ScanSaves() {
+    std::error_code ec;
+    save_exists_ = fs::is_directory(SaveDir(), ec);
+    save_bytes_ = 0, save_files_ = 0;
+    if (!save_exists_) return;
+    for (const auto& e : fs::recursive_directory_iterator(SaveDir(), ec))
+      if (e.is_regular_file(ec) && U8(e.path()).find("/cache") == std::string::npos)
+        save_bytes_ += e.file_size(ec), ++save_files_;
+  }
+
+  void SavesPage() {
+    GroupTitle("YOUR SAVE");
+    if (save_exists_) ImGui::Text("%d files, %.1f MB", save_files_, double(save_bytes_) / (1024.0 * 1024.0));
+    else Note("No save yet (the game makes one the first time it saves).");
+    Note("Saves live in the app's own folder: uninstalling the app deletes them. Export a copy first.");
+    ImGui::Dummy(ImVec2(0, D(6)));
+    if (Button("EXPORT SAVE (.ZIP)", save_exists_)) platform::ExportSaves(SaveDir());
+    if (Button("IMPORT SAVE (.ZIP)")) platform::ImportSaves(SaveDir());
+    Note("Import replaces the current save; the old one is kept next to it as a backup.");
+    // Session 95 (LADDER): the launcher keeps the last two states of the save it saw before a PLAY.
+    GroupTitle("SNAPSHOTS BEFORE PLAY");
+    bool any = false;
+    for (int slot = 0; slot < 2; ++slot) {
+      std::error_code ec;
+      if (!fs::is_directory(SnapDir(slot), ec)) continue;
+      any = true;
+      const std::string label = "RESTORE SNAPSHOT " + std::to_string(slot + 1) + " (" + SnapTime(slot) + ")";
+      if (restore_confirm_ == slot) {
+        if (Button(("TAP AGAIN TO RESTORE SNAPSHOT " + std::to_string(slot + 1)).c_str())) RestoreSnapshot(slot);
+        if (Button("CANCEL")) restore_confirm_ = -1;
+      } else if (Button(label.c_str())) {
+        restore_confirm_ = slot;
+      }
+    }
+    if (!any) Note("None yet: a copy of the save is kept each time you press PLAY and it has changed (two copies, at most 64 MB).");
+    else Note("A restore keeps the current save next to it as wwe2k14.before_restore.");
+  }
+
+  // ---------------------------------------------------------------- Session 95 (LADDER): save snapshots
+  fs::path SnapRoot() const { return files_ / "save_snapshots"; }
+  fs::path SnapDir(int slot) const { return SnapRoot() / ("snap" + std::to_string(slot)); }
+  // Count, bytes and newest modification time of the save (the cache folder left out), as one line.
+  std::string SaveSignature(unsigned long long* bytes = nullptr) const {
+    std::error_code ec;
+    unsigned long long total = 0, newest = 0, count = 0;
+    for (const auto& e : fs::recursive_directory_iterator(SaveDir(), ec)) {
+      if (!e.is_regular_file(ec) || U8(e.path()).find("/cache") != std::string::npos) continue;
+      total += e.file_size(ec), ++count;
+      newest = std::max<unsigned long long>(newest, (unsigned long long)e.last_write_time(ec).time_since_epoch().count());
+    }
+    if (bytes) *bytes = total;
+    return std::to_string(count) + " " + std::to_string(total) + " " + std::to_string(newest);
+  }
+  std::string SnapTime(int slot) const {
+    std::ifstream f(SnapRoot() / "state.txt");
+    std::string l0, l1, l2, l3;
+    std::getline(f, l0), std::getline(f, l1), std::getline(f, l2), std::getline(f, l3);
+    const std::string& t = slot == 0 ? l2 : l3;
+    return t.empty() ? std::string("saved earlier") : t;
+  }
+  void SnapshotSaves() {
+    std::error_code ec;
+    if (!fs::is_directory(SaveDir(), ec)) return;
+    unsigned long long bytes = 0;
+    const std::string sig = SaveSignature(&bytes);
+    std::ifstream in(SnapRoot() / "state.txt");
+    std::string last_sig, next, t0, t1;
+    std::getline(in, last_sig), std::getline(in, next), std::getline(in, t0), std::getline(in, t1);
+    in.close();
+    if (sig == last_sig) return;  // unchanged since the last snapshot
+    if (bytes > 64ull * 1024 * 1024) {
+      Log("saves: %.0f MB is over the 64 MB snapshot cap: no snapshot", double(bytes) / (1024.0 * 1024.0));
+      return;
+    }
+    const int slot = next == "1" ? 1 : 0;
+    // Copied beside the slot first and moved into place only when every copy worked: a full phone must not turn a good snapshot
+    // into a truncated one.
+    const fs::path tmp = SnapRoot() / ("snap" + std::to_string(slot) + ".tmp");
+    fs::remove_all(tmp, ec);
+    fs::create_directories(tmp, ec);
+    bool copy_ok = !ec;
+    for (const auto& e : fs::recursive_directory_iterator(SaveDir(), ec)) {
+      if (!copy_ok) break;
+      if (U8(e.path()).find("/cache") != std::string::npos) continue;
+      std::error_code cec;
+      const fs::path rel = fs::relative(e.path(), SaveDir(), cec);
+      if (e.is_directory(cec)) fs::create_directories(tmp / rel, cec);
+      else if (e.is_regular_file(cec)) fs::copy_file(e.path(), tmp / rel, fs::copy_options::overwrite_existing, cec);
+      if (cec) copy_ok = false;
+    }
+    if (!copy_ok || ec) {
+      Log("saves: snapshot copy failed (%s): the earlier snapshot is kept", ec ? ec.message().c_str() : "a file would not copy");
+      fs::remove_all(tmp, ec);
+      return;
+    }
+    fs::remove_all(SnapDir(slot), ec);
+    fs::rename(tmp, SnapDir(slot), ec);
+    if (ec) {
+      Log("saves: snapshot could not be put in place: %s", ec.message().c_str());
+      fs::remove_all(tmp, ec);
+      return;
+    }
+    char stamp[32] = "";
+    const std::time_t now = std::time(nullptr);
+    std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M", std::localtime(&now));
+    (slot == 0 ? t0 : t1) = stamp;
+    std::ofstream(SnapRoot() / "state.txt", std::ios::trunc) << sig << "\n" << (slot == 0 ? 1 : 0) << "\n" << t0 << "\n" << t1 << "\n";
+    Log("saves: snapshot %d kept (%.1f MB)", slot + 1, double(bytes) / (1024.0 * 1024.0));
+  }
+  void RestoreSnapshot(int slot) {
+    std::error_code ec;
+    if (!fs::is_directory(SnapDir(slot), ec)) return;
+    // The current save is set aside, never deleted: two sets are kept (the older one goes when a third restore needs the name).
+    const fs::path parent = SaveDir().parent_path();
+    const std::string base = SaveDir().filename().string() + ".before_restore";
+    fs::path before = parent / base;
+    if (fs::exists(before, ec)) {
+      fs::remove_all(parent / (base + "_old"), ec);
+      fs::rename(before, parent / (base + "_old"), ec);
+    }
+    if (fs::is_directory(SaveDir(), ec)) fs::rename(SaveDir(), before, ec);
+    if (ec) {
+      ShowToast("Could not set the current save aside: nothing restored", 8000);
+      return;
+    }
+    fs::create_directories(SaveDir(), ec);
+    fs::copy(SnapDir(slot), SaveDir(), fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    // The shader caches stay with the game, not the save (snapshots leave them out): bring them back, as SaveZip does for an import.
+    // Without them the launcher would think the precompile is done while the store is gone.
+    std::error_code rec;
+    for (const char* keep : {"cache", "cache_partition"})
+      if (fs::is_directory(before / keep, rec) && !fs::exists(SaveDir() / keep, rec)) fs::rename(before / keep, SaveDir() / keep, rec);
+    Log("saves: snapshot %d restored (%s)", slot + 1, ec ? ec.message().c_str() : "ok");
+    ShowToast(ec ? "Restore failed: the old save is in wwe2k14.before_restore" : "Snapshot restored", 6000);
+    restore_confirm_ = -1;
+    ScanSaves();
+  }
+  int restore_confirm_ = -1;  // the slot whose RESTORE was pressed once (the second press does it)
+
+  void HelpPage() {
+    GroupTitle("PROBLEM REPORTS");
+    // Session 73: how the last game run ended, and the phone check.
+    if (!last_run_.empty()) {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.55f, 0.45f, 1.0f));
+      ImGui::TextWrapped("%s", last_run_.c_str());
+      ImGui::PopStyleColor();
+    }
+    if (Button("SHARE THE LAST GAME LOG")) ShareLogs();
+    Note("Sends one .zip through Android's share menu (Discord, email...): a short report, the newest game log, its "
+         "start-up record, the launcher's log and settings and this phone's check.");
+    SafeModeHelpUi();  // Session 95 (LADDER)
+    DiagHelpUi();  // Session 95: DIAGNOSTIC RUN, above CHECK THIS PHONE
+    if (Button("CHECK THIS PHONE")) RunCheck();
+    for (const auto& line : check_) {
+      static const ImVec4 kColors[3] = {ImVec4(0.55f, 0.9f, 0.55f, 1.0f), ImVec4(1.0f, 0.8f, 0.35f, 1.0f),
+                                        ImVec4(1.0f, 0.45f, 0.4f, 1.0f)};
+      static const char* const kMarks[3] = {"OK", "!", "X"};
+      ImGui::PushStyleColor(ImGuiCol_Text, kColors[std::clamp(line.level, 0, 2)]);
+      ImGui::TextWrapped("%s  %s", kMarks[std::clamp(line.level, 0, 2)], line.text.c_str());
+      ImGui::PopStyleColor();
+    }
+    if (check_.empty()) {
+      Note("Tests what stops the game before its first picture: the game files, storage, memory, the game's memory "
+           "block and the phone's Vulkan driver.");
+    }
+    // Session 80 (Jarrod: "a little fps/frametime/temperature graph ... the toggle in the logging settings"; "light and
+    // verbose").
+    GroupTitle("PERFORMANCE OVERLAY");
+    static constexpr const char* kOverlay[] = {"OFF", "LIGHT (just the numbers)", "VERBOSE (with a frame-time graph)"};
+    for (int i = 0; i < 3; ++i)
+      if (Choice(kOverlay[i], s_.perf_overlay == i)) s_.perf_overlay = i, Save();
+    Note("The frame rate, the frame time and the phone's temperature in a corner while you play.");
+    GroupTitle("UPDATES");
+    if (Toggle("Check for updates", s_.check_updates, "Asks GitHub when the app opens")) {
+      Save();
+      if (s_.check_updates) CheckUpdate();
+    }
+    switch (update_.state) {
+      case launcher::UpdateInfo::kChecking: Note("Checking..."); break;
+      case launcher::UpdateInfo::kLatest: ImGui::TextColored(kGood, "No newer release"); break;
+      case launcher::UpdateInfo::kFailed: ImGui::TextColored(kBad, "Update check failed: %s", update_.error.c_str()); break;
+      case launcher::UpdateInfo::kAvailable:
+        // Session 81: the app installs its own updates: download, SHA-256 check, then Android's own install screen.
+        ImGui::TextColored(kGood, "New release: %s", (update_.name.empty() ? update_.tag : update_.name).c_str());
+        if (!update_.notes.empty()) {
+          ImGui::BeginChild("update_notes", ImVec2(0, D(260)), ImGuiChildFlags_Borders);
+          launcher::RenderMarkdown(update_.notes, ImGui::GetContentRegionAvail().x - D(6), D(1),
+                                   [](const std::string& l) { if (l.rfind("https://", 0) == 0) platform::OpenUrl(l); });
+          ImGui::EndChild();
+        }
+        if (!up_error_.empty()) {
+          ImGui::PushStyleColor(ImGuiCol_Text, kBad);
+          ImGui::TextWrapped("The update could not be installed: %s", up_error_.c_str());
+          ImGui::PopStyleColor();
+          Note("Your installed version is unchanged. Send the logs to share what happened, or install it from the release page.");
+        }
+        if (up_stage_ == 1) {
+          const unsigned long long total = std::max<unsigned long long>(up_total_, update_.asset_size);
+          ImGui::Text("Downloading... %llu MB of %llu MB", up_done_ >> 20, total >> 20);
+          ImGui::ProgressBar(total ? float(double(up_done_) / double(total)) : 0.f, ImVec2(-1, D(10)), "");
+          Note("The download is checked against GitHub's checksum before anything is changed.");
+        } else if (up_stage_ == 2) {
+          Note("Downloaded and checked. Android asks you to confirm the install; the first time it also asks to allow "
+               "installs from this app. Your saves and settings stay.");
+          if (Button("INSTALL")) platform::InstallUpdate();
+        } else if (!update_.asset_url.empty()) {
+          const std::string size_note = "Updating downloads the new app (about " +
+                                        std::to_string((update_.asset_size + (1u << 20) - 1) >> 20) +
+                                        " MB, nothing before you press the button). Your saves and settings stay.";
+          Note(size_note.c_str());
+          if (Button("UPDATE NOW")) {
+            up_stage_ = 1, up_done_ = up_total_ = 0, up_error_.clear();
+            Log("update: downloading %s", update_.asset_name.c_str());
+            platform::DownloadUpdate(update_.asset_url, update_.asset_sha256);
+          }
+        }
+        if (Button("VIEW ON GITHUB")) platform::OpenUrl(update_.url);
+        break;
+      default: break;
+    }
+    if (update_.state != launcher::UpdateInfo::kChecking && Button("CHECK NOW")) CheckUpdate();
+    GroupTitle("ABOUT");
+    ImGui::Text("WWE 2K14 recompiled, %s", kVersion);
+    Note("A fan preservation project: the Xbox 360 game, recompiled to run natively. Free and non-commercial. It "
+         "needs your own copy of the game; nothing from the game ships with the app. Not affiliated with WWE or 2K.");
+  }
+
+  // ---------------------------------------------------------------- actions
+  void CheckUpdate() {
+    update_ = {};
+    update_.state = launcher::UpdateInfo::kChecking;
+    platform::CheckForUpdate(kVersion);
+  }
+
+  // Session 73: CHECK THIS PHONE.
+  void RunCheck() {
+    check_ = check::CheckPhone(files_, game_ok_, game_error_, s_.game_name, s_.driver);
+    for (const auto& line : check_) Log("phone check %s: %s", line.level == 0 ? "ok" : line.level == 1 ? "warn" : "FAIL",
+                                        line.text.c_str());
+  }
+
+  // hand_over false (--share-test): makes the zip, no share sheet.
+  void ShareLogs(bool hand_over = true) {
+    std::vector<fs::path> out;
+    std::error_code ec;
+    fs::path newest;
+    fs::file_time_type t{};
+    for (const auto& e : fs::directory_iterator(files_ / "logs", ec)) {
+      const std::string n = U8(e.path().filename());
+      if (n.rfind("wwe2k14_", 0) != 0 || e.path().extension() != ".log") continue;
+      if (U8(e.path().stem()).find('.') != std::string::npos) continue;  // a rotated part (below)
+      const auto wt = e.last_write_time(ec);
+      if (newest.empty() || wt > t) newest = e.path(), t = wt;
+    }
+    if (!newest.empty()) out.push_back(newest);
+    // Part 8: a long run's log rotates every 5 MB (SDK log_max_file_size_mb): wwe2k14_004.log is its newest part,
+    // wwe2k14_004.N.log older ones. The oldest kept (the highest N) has the run's start - the GPU, its driver and
+    // features - which a tester's log lacked: that one goes too.
+    if (!newest.empty()) {
+      const std::string base = U8(newest.stem()) + ".";
+      fs::path oldest;
+      long most = 0;
+      for (const auto& e : fs::directory_iterator(files_ / "logs", ec)) {
+        const std::string n = U8(e.path().filename());
+        // wwe2k14_004.N.log: the name minus base and ".log" (wwe2k14_004.log itself starts with base too).
+        if (n.rfind(base, 0) != 0 || n.size() <= base.size() + 4 || e.path().extension() != ".log") continue;
+        const std::string mid = n.substr(base.size(), n.size() - base.size() - 4);
+        if (mid.empty() || mid.find_first_not_of("0123456789") != std::string::npos || mid.size() > 6) continue;
+        if (const long k = std::stol(mid); k > most) most = k, oldest = e.path();
+      }
+      if (!oldest.empty()) out.push_back(oldest);
+    }
+    // Session 73 (Jarrod: testers send ONE file): everything goes into logs/share/wwe2k14_report_NNN.zip, report.txt
+    // first (share_report.h). The files one by one, as before, only when the zip cannot be written.
+    if (!newest.empty()) Log("share: game log %s", U8(newest.filename()).c_str());
+    const fs::path zip = ShareZip(newest, out.size() > 1 ? out[1] : fs::path());
+    out.push_back(files_ / "logs" / "launcher.log");
+    // Session 73: the last run's start-up record and Android's reason for its end (and its native crash record).
+    for (const char* extra : {"startup.txt", "stderr.txt", "last_game_exit.txt", "last_game_exit_trace.bin", "last_launcher_exit.txt", "run_history.txt"}) {
+      if (fs::is_regular_file(files_ / "logs" / extra, ec)) out.push_back(files_ / "logs" / extra);
+    }
+    if (!zip.empty()) out = {zip};
+    if (!hand_over) return;
+    if (newest.empty()) ShowToast("No game log yet: sharing the launcher's log");
+    platform::Share(out);
+  }
+
+  // The zip SHARE sends: report.txt, the game log (and its oldest kept part), frames_NNN.csv, the start-up record,
+  // Android's exit record, the launcher's log and settings, phone.txt (CHECK THIS PHONE). Empty when it failed.
+  fs::path ShareZip(const fs::path& game_log, const fs::path& oldest_part) {
+    std::error_code ec;
+    const fs::path logs = files_ / "logs", dir = logs / "share";
+    fs::create_directories(dir, ec);
+    // NNN: wwe2k14_116.log -> 116.
+    std::string num;
+    if (!game_log.empty()) num = U8(game_log.stem()).substr(8);
+    const fs::path frames = num.empty() ? fs::path() : logs / fs::u8path("frames_" + num + ".csv");
+    const fs::path memory = num.empty() ? fs::path() : logs / fs::u8path("mem_" + num + ".csv");  // Session 95 (HANG)
+    const fs::path path = dir / fs::u8path("wwe2k14_report_" + (num.empty() ? std::string("none") : num) + ".zip");
+    // Only the newest report stays (they are copies of the logs).
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+      const std::string n = U8(e.path().filename());
+      if (n.rfind("wwe2k14_report_", 0) == 0 && e.path() != path) fs::remove(e.path(), ec);
+    }
+    if (check_.empty()) RunCheck();
+    report::Inputs in;
+    in.launcher_version = kVersion;
+    in.last_run = last_run_;
+    if (rung_.rung > 0) in.rung_text = "step " + std::to_string(rung_.rung) + " (" + ladder::RungWords(rung_.rung) + ")";
+    in.logs_dir = logs;
+    if (!oldest_part.empty()) in.game_logs.push_back(oldest_part);
+    if (!game_log.empty()) in.game_logs.push_back(game_log);
+    in.frames_csv = frames;
+    const std::string text = report::Build(in);
+    std::string phone;
+    static const char* const kMarks[3] = {"OK", "!", "X"};
+    for (const auto& line : check_) phone += std::string(kMarks[std::clamp(line.level, 0, 2)]) + "  " + line.text + "\n";
+
+    zip::Writer z(path);
+    bool ok = z.ok() && z.AddText("report.txt", text);
+    auto add = [&](const fs::path& f) {
+      if (ok && !f.empty() && fs::is_regular_file(f, ec)) ok = z.AddFile(U8(f.filename()), f);
+    };
+    add(game_log);
+    add(oldest_part);
+    add(frames);
+    add(memory);
+    for (const char* extra : {"startup.txt", "stderr.txt", "hang.txt", "last_game_exit.txt", "last_game_exit_trace.bin", "last_launcher_exit.txt", "run_history.txt"}) add(logs / extra);
+    // Session 98: the last tron export's timings and progress (our own numbers, no game data) for the speed work
+    add(TronsDir() / "timings.json");
+    add(TronsDir() / "progress.json");
+    Log("share: report zip %s", U8(path).c_str());  // before the copy, so the zip's launcher.log has it
+    add(logs / "launcher.log");
+    add(SettingsPath());
+    if (ok) ok = z.AddText("phone.txt", phone);
+    const size_t entries = z.count();
+    ok = z.Finish() && ok;
+    if (!ok) {
+      Log("share: could not write %s: sharing the files one by one", U8(path).c_str());
+      fs::remove(path, ec);
+      return {};
+    }
+    Log("share: %s written, %zu files, %llu bytes", U8(path).c_str(), entries,
+        static_cast<unsigned long long>(fs::file_size(path, ec)));
+    return path;
+  }
+
+  // ------------------------------------------------------------ Session 93: the shader precompile (M6 step 2)
+  // The PC launcher's logic (launcher_main.cpp PrecompileKey / StartPrecompile / PollPrecompile), for the phone, where the game
+  // is another process and an activity: before the first PLAY after an install, an update or a setting that changes the
+  // translation store's key (PrecompileKey, mobile_settings.h), the launcher starts the game once in its precompile mode
+  // (--wwe2k14_precompile=FILE, src\precompile.h). That run translates the shader list's variants (the V lines) into the phone's
+  // store and makes the stored pipelines; GameActivity shows "Preparing shaders 120 / 462" from the progress file, and when the
+  // game has written its last state it writes precompile_return.txt and brings this launcher back; the launcher then writes
+  // the stamp and goes on with the PLAY (the same wm30 match) at once. The stamp holds the key of the last precompile that
+  // ended ("done", or "failed" - a timeout is not retried until the key changes, so a slow phone is not made to wait at every
+  // PLAY): the same key = no second run. Only under TRUE NATIVE (the store is on under it, src\d3d_owned.h).
+  fs::path PrecompileStampPath() const { return files_ / "precompile_stamp.txt"; }
+  fs::path PrecompileProgressPath() const { return files_ / "precompile_progress.json"; }
+  fs::path PrecompileReturnPath() const { return files_ / "precompile_return.txt"; }
+  fs::path PrecompilePendingPath() const { return files_ / "precompile_pending.txt"; }
+  static bool PrecompileSupported() {
+    return std::string(platform::Name()) == "android" || std::getenv("WWE2K14_PRECOMPILE") != nullptr;  // (the PC test build: by hand)
+  }
+  // (Session 93 review: + the game's libraries - a dev / tester APK with a new SDK keeps the same VERSION; as the PC launcher's
+  // key has the exe and DLLs' size and time.)
+  std::string CurrentPrecompileKey() const {
+    std::string libs;
+    for (const char* f : {"librexgpu-xenos.so", "libmain.so"}) {
+      std::error_code ec;
+      const fs::path p = platform::NativeLibDir() / f;
+      const auto size = fs::file_size(p, ec);
+      libs += std::string(f) + " " + std::to_string((unsigned long long)(ec ? 0 : size)) + " " +
+              std::to_string((long long)fs::last_write_time(p, ec).time_since_epoch().count()) + "; ";
+    }
+    return libs + PrecompileKey(s_, kVersion, platform::DeviceKey());
+  }
+  bool NeedPrecompile() const {
+    if (!PrecompileSupported() || !WantsPrecompile(s_)) return false;
+    std::ifstream f(PrecompileStampPath());
+    std::string state, key;
+    std::getline(f, state), std::getline(f, key);
+    return key != CurrentPrecompileKey();  // (no stamp: key empty)
+  }
+  void WriteStamp(const std::string& state) {
+    std::ofstream(PrecompileStampPath(), std::ios::trunc) << state << "\n" << CurrentPrecompileKey() << "\n";
+  }
+  LaunchContext MakeContext(int wm30) {
+    SyncSuperstarsKey(true);  // Session 98 (importer review): GameArgs reads s_.superstars right after this
+    LaunchContext c;
+    c.game_path = address_.rfind("content://", 0) == 0 ? kGameFdToken : read_path_;
+    std::error_code ec;
+    if (fs::is_directory(DlcDir(), ec)) c.dlc_dir = U8(DlcDir());
+    if (fs::is_directory(files_ / "mods" / "superstars", ec)) c.mods_dir = U8(files_ / "mods");  // Session 98 (Superstar Importer)
+    if (s_.music && MusicHasContent()) c.music_dir = U8(files_ / "mods"), c.music_themes = music::HasAnyTheme(files_ / "mods");  // Lane 286
+    platform::ScreenSize(c.screen_w, c.screen_h);
+    c.wm30 = wm30;
+    c.rung = rung_.rung;  // Session 95 (LADDER)
+    if (const UserDriver* u = FindUserDriver(s_.driver)) {  // part 8: an imported driver, from its own folder
+      c.driver_library = u->library;
+      c.driver_dir = U8(platform::DriversDir() / fs::u8path(u->folder)) + "/";
+    }
+    return c;
+  }
+  // The precompile run: the Play's arguments (same graphics, same driver: the keys the play will ask for) without the match
+  // to jump into and without the driver trial (that belongs to the real game: it must not be used up here).
+  void StartPrecompile(int wm30) {
+    if (TronsBlock("PLAY")) return;  // Session 98
+    LaunchContext pc = MakeContext(-1);
+    pc.rung = 0;  // (Safe Mode steps are for the play: one shader worker would make the precompile overrun its deadline)
+    std::vector<std::string> args = GameArgs(s_, pc);
+    args.push_back("--wwe2k14_precompile=" + U8(PrecompileProgressPath()));
+    std::error_code ec;
+    fs::remove(PrecompileProgressPath(), ec);
+    fs::remove(PrecompileReturnPath(), ec);
+    std::ofstream(PrecompilePendingPath(), std::ios::trunc) << wm30 << "\n";
+    std::string line;
+    for (const auto& a : args) line += " " + a;
+    Log("PRECOMPILE (key: %s):%s", CurrentPrecompileKey().c_str(), line.c_str());
+    platform::TouchChoice t;
+    t.mode = 2;  // (TouchOverlay.MODE_OFF: nothing to play)
+    platform::StartGame(args, address_, t);
+  }
+  // At the launcher's start: the precompile that was running has ended (or the game died).
+  void ResumeAfterPrecompile() {
+    std::error_code ec;
+    if (!fs::exists(PrecompilePendingPath(), ec)) return;
+    int wm30 = -1;
+    {
+      std::ifstream f(PrecompilePendingPath());
+      f >> wm30;
+    }
+    std::string state;
+    {
+      std::ifstream f(PrecompileReturnPath());
+      std::getline(f, state);
+    }
+    fs::remove(PrecompilePendingPath(), ec);
+    fs::remove(PrecompileReturnPath(), ec);
+    Log("precompile: ended with \"%s\" (match %d)", state.c_str(), wm30);
+    if (state == "cancelled") {
+      // (Session 93 review: the game it was for starts once without it; no stamp, so the next PLAY prepares again.)
+      ShowToast("Shaders will be prepared at the next PLAY", 6000);
+      if (game_ok_) resume_play_ = true, resume_wm30_ = wm30;
+    } else if (state.empty()) {  // no marker: the game's process died (Android closed it, or it crashed)
+      WriteStamp("failed");
+      ShowToast("Shader preparation stopped unexpectedly (see the game log). PLAY starts the game without it.", 10000);
+    } else {
+      WriteStamp(state == "done" ? "done" : "failed");
+      if (state != "done")
+        ShowToast("Shader preparation did not finish in time: playing without it. It is tried again after an update or a settings change.", 8000);
+      if (game_ok_) resume_play_ = true, resume_wm30_ = wm30;
+    }
+  }
+
+  // ------------------------------------------------------------ Session 95: DIAGNOSTIC RUN (src\diag_plan.h, src\diag.h)
+  // One button, hands-free, about 3 minutes, one zip (Jarrod, 2026-11-06). Each arm is one run of the game (the precompile's
+  // pattern): the launcher writes diag_pending.txt and starts the game with the arm's flags (a copy of GameArgs with the arm's
+  // change - the player's settings are never edited); the route ends with `quit`, which brings the launcher back (a crash or
+  // the player's Back does too); ResumeAfterDiag then copies that arm's logs into the run folder and starts the next arm
+  // (after a short pause with a CANCEL), or builds the zip. The game's own watchdog (src/diag.h) ends a stuck arm. A run
+  // folder without a zip is finished the next time the launcher starts (unfinished arms are named in the zip).
+  fs::path DiagRoot() const { return files_ / "diag"; }
+  fs::path DiagPendingPath() const { return files_ / "diag_pending.txt"; }
+  fs::path DiagLastZipPath() const { return files_ / "diag_last_zip.txt"; }
+  struct DiagRun {
+    fs::path run;
+    size_t idx = 0;
+    long start = 0, arm_start = 0;
+    bool long_run = false;
+    bool running = false;  // review F13: an arm was started and has not been collected yet
+    std::vector<wwe2k14::diag_plan::Arm> arms;
+    std::vector<std::string> skipped;
+  };
+  static long DiagNow() { return long(std::time(nullptr)); }
+  static std::vector<std::string> DiagReadLines(const fs::path& p) {
+    std::vector<std::string> v;
+    std::ifstream f(p);
+    for (std::string l; std::getline(f, l);)
+      if (!l.empty()) v.push_back(l);
+    return v;
+  }
+  static void DiagWrite(const fs::path& p, const std::string& text) {
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    std::ofstream(p, std::ios::binary | std::ios::trunc) << text;
+  }
+  void DiagSave(const DiagRun& r) {
+    std::string t = U8(r.run) + "\n" + std::to_string(r.idx) + "\n" + std::to_string(r.start) + "\n" +
+                    std::to_string(r.arm_start) + "\n" + (r.long_run ? "1" : "0") + "\n";
+    for (const auto& a : r.arms) t += "arm|" + a.id + "|" + a.title + "|" + (a.full ? "1" : "0") + "|" + std::to_string(a.est_s) + "\n";
+    for (const auto& s : r.skipped) t += "skip|" + s + "\n";
+    if (r.running) t += "running|1\n";
+    DiagWrite(DiagPendingPath(), t);
+  }
+  bool DiagLoad(DiagRun& r) {
+    const auto v = DiagReadLines(DiagPendingPath());
+    if (v.size() < 5) return false;
+    r.run = fs::u8path(v[0]);
+    r.idx = size_t(std::atol(v[1].c_str()));
+    r.start = std::atol(v[2].c_str()), r.arm_start = std::atol(v[3].c_str());
+    r.long_run = v[4] == "1";
+    for (size_t i = 5; i < v.size(); ++i) {
+      if (v[i].rfind("skip|", 0) == 0) {
+        r.skipped.push_back(v[i].substr(5));
+      } else if (v[i] == "running|1") {
+        r.running = true;
+      } else if (v[i].rfind("arm|", 0) == 0) {
+        std::vector<std::string> f;
+        std::stringstream ss(v[i].substr(4));
+        for (std::string x; std::getline(ss, x, '|');) f.push_back(x);
+        if (f.size() == 4) r.arms.push_back({f[0], f[1], f[2] == "1", std::atoi(f[3].c_str())});
+      }
+    }
+    return !r.arms.empty() && r.idx < r.arms.size() + 1;
+  }
+  int DiagBudget(const DiagRun& r) const { return r.long_run ? 300 : 180; }
+
+  void StartDiag() {
+    if (TronsBlock("The diagnostic run")) return;  // Session 98
+    namespace dp = wwe2k14::diag_plan;
+    if (!game_ok_) {
+      GoPage(kGameFiles);
+      ShowToast("Choose your game files first");
+      return;
+    }
+    // Session 73: 16 KB memory pages would break the game's memory: the same refusal as PLAY (review F11).
+    if (const std::string pages = check::PageSizeProblem(); !pages.empty()) {
+      Log("DIAGNOSTIC RUN refused: %s", pages.c_str());
+      ShowToast(pages, 10000);
+      return;
+    }
+    DiagRun r;
+    r.start = DiagNow();
+    r.long_run = diag_long_;
+    r.run = DiagRoot() / ("run_" + std::to_string(r.start));
+    std::error_code ec;
+    // An earlier run's folders are not needed any more; diag/cache stays (the arms after arm 0 use it: review F10).
+    for (const auto& e : fs::directory_iterator(DiagRoot(), ec))
+      if (U8(e.path().filename()).rfind("run_", 0) == 0) fs::remove_all(e.path(), ec);
+    fs::create_directories(r.run / "save", ec);
+    std::vector<std::string> base = GameArgs(s_, MakeContext(-1));
+    std::string flat;
+    for (const auto& a : base) flat += a + "\n";
+    DiagWrite(r.run / "base_flags.txt", flat);
+    DiagWrite(r.run / "route_full.txt", dp::Route(true, true));  // hold: the route never quits the game (review F2)
+    DiagWrite(r.run / "route_entrance.txt", dp::Route(false, true));
+    DiagWrite(r.run / "route_vertex.txt", dp::Route(false, true, true));
+    DiagWrite(r.run / "system.txt", std::string("WWE 2K14 phone diagnostic run (Session 95)\nLauncher: ") + kVersion + "\nplatform: " +
+                                        platform::Name() + "\ndevice key: " + platform::DeviceKey() + "\n\n" +
+                                        mlauncher::diag::SystemText("start"));
+    DiagWrite(r.run / "launcher_settings.json", mlauncher::diag::ReadSmall(SettingsPath(), 65536));
+    r.arms = dp::PlanArms(base, &r.skipped, true);
+    r.idx = 0;
+    diag_zip_.clear();
+    DiagStartArm(r);
+  }
+  void DiagStartArm(DiagRun& r) {
+    namespace dp = wwe2k14::diag_plan;
+    const dp::Arm arm = r.arms[r.idx];
+    std::vector<std::string> args = dp::ArmArgs(arm, DiagReadLines(r.run / "base_flags.txt"));
+    const fs::path adir = r.run / ("arm" + arm.id);
+    std::error_code ec;
+    fs::create_directories(adir, ec);
+    // (indexes 1 and 2 always run in full: the storage arm and the vertex truth are not cut by arm 0's time - review F9)
+    const int arm_s = r.idx <= 2 ? arm.est_s * 2 + 30 : std::max(30, std::min(arm.est_s * 2 + 30, DiagBudget(r) + 60 - int(DiagNow() - r.start)));
+    const std::string route = U8(r.run / dp::RouteFile(arm));
+    for (const std::string& a : dp::DiagArgs(U8(r.run), arm.id, route, arm_s, U8(adir / "device.json"), true)) {
+      const size_t eq = a.find('=');
+      dp::SetFlag(args, a.substr(2, eq - 2), a.substr(eq + 1));
+    }
+    dp::SetFlag(args, "user_data_root", U8(r.run / "save"));  // a save of its own: the player's is never touched
+    if (arm.id != "0") dp::SetFlag(args, "cache_root", U8(DiagRoot() / "cache"));
+    dp::RemoveFlag(args, "wwe2k14_wm30");
+    dp::RemoveFlag(args, "wwe2k14_perf_overlay");
+    r.arm_start = DiagNow();
+    r.running = true;
+    DiagSave(r);
+    std::string line;
+    for (const auto& a : args) line += " " + a;
+    DiagWrite(adir / "command.txt", line + "\n");
+    Log("DIAGNOSTIC RUN arm %s (%s):%s", arm.id.c_str(), arm.title.c_str(), line.c_str());
+    platform::TouchChoice t;
+    t.mode = 2;  // (TouchOverlay.MODE_OFF: the route drives the pad)
+    platform::StartGame(args, address_, t);
+  }
+  // From the constructor: a diagnostic arm that was running has ended (or the game died).
+  void ResumeAfterDiag() {
+    namespace dp = wwe2k14::diag_plan;
+    std::error_code ec;
+    diag_arm_ended_ = fs::exists(DiagPendingPath(), ec);  // (an arm of the diagnostic run is not a player run: LadderStart does not record it)
+    if (!fs::exists(DiagPendingPath(), ec)) {
+      const auto z = DiagReadLines(DiagLastZipPath());
+      if (!z.empty() && fs::exists(fs::u8path(z[0]), ec)) diag_zip_ = fs::u8path(z[0]), diag_result_ = z.size() > 1 ? z[1] : std::string();
+      return;
+    }
+    DiagRun r;
+    if (!DiagLoad(r)) {
+      fs::remove(DiagPendingPath(), ec);
+      return;
+    }
+    if (r.idx < r.arms.size() && r.running) {
+      const auto& arm = r.arms[r.idx];
+      const fs::path adir = r.run / ("arm" + arm.id);
+      // The arm's own game log, frame CSV and start-up records. Only its own: the newest run number above every number already in
+      // the run folder (the next launch touches the older log; the time window alone also took the arm before: zip 59.7 MB, diag3).
+      // The log is cut (src/diag_logcut.h: repeated line shapes folded).
+      namespace lc = wwe2k14::diag_logcut;
+      const long age_limit = DiagNow() - r.arm_start + 5;
+      auto age_of = [&](const fs::directory_entry& e) {
+        return std::chrono::duration_cast<std::chrono::seconds>(fs::file_time_type::clock::now() - e.last_write_time(ec)).count();
+      };
+      long have = -1, mine = -1;
+      for (const auto& e : fs::recursive_directory_iterator(r.run, ec))
+        if (e.is_regular_file()) have = std::max(have, lc::NumberOf(U8(e.path().filename())));
+      for (const auto& e : fs::directory_iterator(files_ / "logs", ec)) {
+        const std::string n = U8(e.path().filename());
+        const long num = lc::NumberOf(n);
+        if (n.rfind("wwe2k14_", 0) == 0 && e.is_regular_file() && num > have && age_of(e) <= age_limit) mine = std::max(mine, num);
+      }
+      for (const auto& e : fs::directory_iterator(files_ / "logs", ec)) {
+        const std::string n = U8(e.path().filename());
+        const bool numbered = (n.rfind("wwe2k14_", 0) == 0 && e.path().extension() == ".log") || n.rfind("frames_", 0) == 0 || n.rfind("mem_", 0) == 0;
+        const bool other = n.rfind("timeline_", 0) == 0 || n == "startup.txt" || n == "stderr.txt" || n == "hang.txt" || n == "last_game_exit.txt" || n == "last_game_exit_trace.bin";
+        if (!e.is_regular_file() || !(numbered || other)) continue;
+        if (numbered ? lc::NumberOf(n) != mine : age_of(e) > age_limit) continue;
+        if (e.path().extension() == ".log") {
+          std::ifstream in(e.path(), std::ios::binary);
+          std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+          DiagWrite(adir / e.path().filename(), lc::Cut(text));
+        } else {
+          fs::copy_file(e.path(), adir / e.path().filename(), fs::copy_options::overwrite_existing, ec);
+        }
+      }
+      const auto st = DiagReadLines(adir / "state.json");
+      const bool reached_done = !st.empty() && st[0].find("\"done\"") != std::string::npos;
+      // Which stage the route stopped at (the game's stages.log): a failed route must look failed (run 6629: every arm ended in 3 s).
+      std::string stages;
+      for (const auto& l : DiagReadLines(adir / "stages.log")) stages += l + "\n";
+      const bool cancelled = fs::exists(adir / "cancel.txt", ec);
+      const std::string failure = cancelled ? std::string() : wwe2k14::diag_plan::RouteFailure(stages, DiagNow() - r.arm_start);
+      const std::string verdict = cancelled ? "cancelled by the player" : !failure.empty() ? failure : reached_done ? "route reached done" : "route reached done (state.json says otherwise)";
+      DiagWrite(adir / "exit.txt", verdict + "\nlast state: " + (st.empty() ? std::string("(none)") : st[0]) + "\nelapsed_s " +
+                                       std::to_string(DiagNow() - r.arm_start) + "\n");
+      Log("diagnostic run: arm %s ended: %s", arm.id.c_str(), verdict.c_str());
+      ++r.idx;
+      r.running = false;
+      if (fs::exists(adir / "cancel.txt", ec)) {  // the player's Back: the chain stops here (review F14)
+        r.skipped.push_back("(the rest): cancelled by the player (Back)");
+        r.idx = r.arms.size();
+      }
+    }
+    // (the first two relaunch arms, indexes 1 and 2, always run: the storage arm and the vertex truth are never cut by arm 0's time - review F9)
+    while (r.idx < r.arms.size() && r.idx > 2) {
+      if (int(DiagNow() - r.start) + r.arms[r.idx].est_s > DiagBudget(r)) {
+        r.skipped.push_back(r.arms[r.idx].id + ": skipped, the time budget (" + std::to_string(DiagBudget(r)) + " s) would be passed");
+        ++r.idx;
+      } else {
+        break;
+      }
+    }
+    if (r.idx < r.arms.size()) {  // the next arm starts in a few seconds; CANCEL on LOGS AND UPDATES stops here
+      DiagSave(r);
+      diag_next_at_ = SDL_GetTicks() + 6000;
+      page_ = kHelp;
+      ShowToast("Diagnostic run: the next step starts in a few seconds", 6000);
+      return;
+    }
+    DiagFinish(r);
+  }
+  void DiagFinish(DiagRun& r) {
+    std::error_code ec;
+    std::string summary, failed;
+    for (const auto& a : r.arms) {
+      const auto ex = DiagReadLines(r.run / ("arm" + a.id) / "exit.txt");
+      // (an arm cut by the time budget or the player's Back never got a folder: it did not fail, it did not run)
+      const bool started = fs::is_directory(r.run / ("arm" + a.id), ec);
+      const std::string line = ex.empty() ? std::string(started ? "did not finish / no exit record" : "did not run") : ex[0];
+      if (line.rfind("ROUTE FAILED", 0) == 0 || (ex.empty() && started)) failed = failed.empty() ? "arm " + a.id + ": " + line : failed;
+      summary += "arm " + a.id + " (" + a.title + "): " + line + "\n";
+    }
+    for (const auto& s : r.skipped) summary += "skipped " + s + "\n";
+    if (!failed.empty()) summary = "RESULT: THE ROUTE FAILED (" + failed + "). The pictures and numbers are incomplete.\n" + summary;
+    DiagWrite(r.run / "arm_summary.txt", summary);
+    DiagWrite(r.run / "system_end.txt", mlauncher::diag::SystemText("end") + "elapsed_s " + std::to_string(DiagNow() - r.start) + "\n");
+    for (const char* extra : {"launcher.log"}) {
+      if (fs::is_regular_file(files_ / "logs" / extra, ec)) fs::copy_file(files_ / "logs" / extra, r.run / extra, fs::copy_options::overwrite_existing, ec);
+    }
+    const fs::path dir = files_ / "logs" / "share";
+    fs::create_directories(dir, ec);
+    for (const auto& e : fs::directory_iterator(dir, ec))
+      if (U8(e.path().filename()).rfind("wwe2k14_diag_", 0) == 0) fs::remove(e.path(), ec);
+    const fs::path zip = dir / fs::u8path("wwe2k14_diag_" + std::to_string(r.start) + ".zip");
+    zip::Writer z(zip);
+    bool ok = z.ok() && z.AddText("about.txt", std::string("WWE 2K14 phone diagnostic run (Session 95)\nLauncher: ") + kVersion +
+                                                   "\nRead with: py -I tools/native/diag_read.py THIS.zip\nThe pictures in shots/ are small "
+                                                   "pictures of the game, made on this phone; they are in this zip only.\n");
+    for (const auto& e : fs::recursive_directory_iterator(r.run, ec)) {
+      if (!ok) break;
+      if (!e.is_regular_file()) continue;
+      const std::string name = fs::relative(e.path(), r.run, ec).generic_string();
+      if (name.rfind("save/", 0) == 0 || name.rfind("cache/", 0) == 0 || e.path().extension() == ".part" || e.path().extension() == ".rgba") continue;
+      ok = z.AddFile(name, e.path());
+    }
+    ok = z.Finish() && ok;
+    fs::remove(DiagPendingPath(), ec);
+    if (ok) {
+      diag_zip_ = zip;
+      DiagWrite(DiagLastZipPath(), U8(zip) + "\n" + failed + "\n");
+      diag_result_ = failed;
+      fs::remove_all(r.run, ec);  // the zip holds everything that matters; the folder would double the storage (review F5)
+      Log("diagnostic run: zip %s (%llu bytes)", U8(zip).c_str(), (unsigned long long)fs::file_size(zip, ec));
+      ShowToast(failed.empty() ? "Diagnostic run done: see LOGS AND UPDATES to share it" : "Diagnostic run did NOT complete: see LOGS AND UPDATES", 8000);
+    } else {
+      Log("diagnostic run: could not write %s", U8(zip).c_str());
+      ShowToast("Could not write the diagnostic zip", 8000);
+    }
+    page_ = kHelp;
+  }
+  void DiagCancel() {
+    DiagRun r;
+    diag_next_at_ = 0;
+    if (DiagLoad(r)) {
+      r.skipped.push_back("(the rest): cancelled by the player");
+      r.idx = r.arms.size();
+      DiagFinish(r);
+    }
+  }
+  // Every frame: the pause between arms ends.
+  void DiagFrame() {
+    if (diag_next_at_ && SDL_GetTicks() >= diag_next_at_) {
+      diag_next_at_ = 0;
+      DiagRun r;
+      if (DiagLoad(r) && r.idx < r.arms.size()) DiagStartArm(r);
+    }
+  }
+  void DiagHelpUi() {
+    GroupTitle("DIAGNOSTIC RUN");
+    if (diag_next_at_) {
+      if (Button("CANCEL THE DIAGNOSTIC RUN")) DiagCancel();
+      Note("The next step starts in a few seconds.");
+      return;
+    }
+    if (diag_confirm_) {
+      Note("The game will look strange during the run (flat grey or black scenes): that is on purpose.");
+      Note("Plays a short scripted Quick Match by itself (about 3 minutes, the game closes and reopens between steps) and "
+           "saves what this phone's GPU reports, the game's logs, timing, and small pictures of a few scenes, then repeats the "
+           "entrance with one setting changed. Don't touch the phone while it runs. If the app closes by itself, open it again: the run goes on. Your saves and settings are not touched; "
+           "the zip holds small pictures of the game. A hot phone makes it slower: let it cool first.");
+      if (Button(diag_long_ ? "LONG RUN: ON (about 5 minutes)" : "LONG RUN: OFF")) diag_long_ = !diag_long_;
+      if (Button("START THE DIAGNOSTIC RUN", !TronZipRunning())) diag_confirm_ = false, StartDiag();
+      if (Button("NOT NOW")) diag_confirm_ = false;
+    } else {
+      if (Button("DIAGNOSTIC RUN")) diag_confirm_ = true;
+      Note("One button for testers: runs a fixed scripted match and saves one report with the GPU's limits, logs, timing and "
+           "small pictures, so nothing needs asking back and forth.");
+    }
+    if (!diag_zip_.empty() && !diag_result_.empty())
+      Note(("The last diagnostic run did NOT complete: " + diag_result_ + ". The zip holds little, but it still says why.").c_str());
+    if (!diag_zip_.empty() && Button("SHARE THE DIAGNOSTIC RUN")) platform::Share({diag_zip_});
+  }
+  bool diag_confirm_ = false, diag_long_ = false;
+  fs::path diag_zip_;
+  std::string diag_result_;  // "" = the route finished; else the failure line (arm_summary.txt says it too)
+  uint32_t diag_next_at_ = 0;
+
+  void Play(int wm30 = -1) {
+    if (mlib_ && mlib_->Busy()) {  // lane 297: the game never converts; PLAY waits for the bar
+      ShowToast("Your songs are still being converted: PLAY when the bar is done", 5000);
+      return;
+    }
+    StopPreview();  // Lane 297: a song heard in the library does not play into the game
+    if (TronsBlock("PLAY")) return;  // Session 98
+    if (!game_ok_) {
+      GoPage(kGameFiles);
+      ShowToast("Choose your game files first");
+      return;
+    }
+    const bool skip_precompile = precompile_skip_once_ || skip_precompile_after_card_;
+    if (!disk_card_) skip_precompile_after_card_ = false;
+    precompile_skip_once_ = false;
+    // Session 73: 16 KB memory pages would break the game's memory (phone_check.h PageSizeProblem): say so instead.
+    if (const std::string pages = check::PageSizeProblem(); !pages.empty()) {
+      Log("PLAY refused: %s", pages.c_str());
+      ShowToast(pages, 10000);
+      return;
+    }
+    // Session 95 (LADDER): a processor the game's build cannot run on says so here; under 200 MB of free storage gives a card first.
+    if (const std::string cpu = check::CpuProblem(); !cpu.empty()) {
+      Log("PLAY refused: %s", cpu.c_str());
+      ShowToast(cpu, 12000);
+      return;
+    }
+    {
+      std::error_code sec;
+      const auto space = fs::space(files_, sec);
+      if (!sec && space.available < 200ull * 1024 * 1024 && !disk_ok_once_) {
+        disk_card_ = true;
+        disk_free_mb_ = double(space.available) / (1024.0 * 1024.0);
+        Log("ladder: only %.0f MB free: the storage card", disk_free_mb_);
+        pending_play_wm30_ = wm30;
+        return;
+      }
+      disk_ok_once_ = false;
+    }
+    if (stars_job_) return ShowToast("Your superstars are being built into the game: PLAY goes on when that is done");  // Session 101
+    if (!stars_skip_once_ && StarsBeforePlay(wm30)) return;  // Session 101 (lane 199): the superstars pack brought up to date first
+    if (!skip_precompile && NeedPrecompile()) {  // Session 93: the shader precompile first (no second one with the same key)
+      Save();
+      StartPrecompile(wm30);
+      return;
+    }
+    LaunchContext c = MakeContext(wm30);
+    if (stars_without_once_) c.mods_dir.clear();  // Session 101 (review S1): PLAY WITHOUT THEM = no --wwe2k14_mods_superstars this time
+    std::error_code ec;
+    if (!s_.driver.empty()) {  // Session 72: the game removes it once it has drawn a few hundred frames
+      std::ofstream(DriverTrialPath(), std::ios::trunc) << s_.driver << "\n";
+      c.driver_trial = U8(DriverTrialPath());
+      // Session 73: asked once, after the first game that gets going with it.
+      if (!IdListHas(s_.drivers_ok, s_.driver) && !IdListHas(s_.drivers_bad, s_.driver)) {
+        std::ofstream(DriverAskPath(), std::ios::trunc) << s_.driver << "\n";
+      }
+    }
+    SnapshotSaves();  // Session 95 (LADDER)
+    {  // Session 95 (LADDER): the boot trial - the game removes this after 600 frames, a quit also removes it
+      std::ofstream(BootTrialPath(), std::ios::trunc) << "boot trial " << kVersion << "\n";
+      c.boot_trial = U8(BootTrialPath());
+    }
+    const std::vector<std::string> args = GameArgs(s_, c);
+    Save();
+    std::string line;
+    for (const auto& a : args) line += " " + a;
+    Log("PLAY:%s", line.c_str());
+    platform::TouchChoice t;
+    t.mode = s_.touch_mode, t.size = s_.touch_size, t.opacity = s_.touch_opacity, t.vibrate = s_.touch_vibrate;
+    platform::StartGame(args, address_, t);
+  }
+
+  void OnEvent(const platform::Event& e) {
+    using E = platform::Event;
+    switch (e.kind) {
+      case E::kGamePicked:
+        if (!e.ok) break;
+        s_.game_uri = e.a, s_.game_name = e.b;
+        Save();
+        RefreshGame();
+        ShowToast(game_ok_ ? "Game files ready" : game_error_);
+        break;
+      case E::kDlcAdded:
+        ShowToast(e.a);
+        ScanDlc();
+        break;
+      case E::kDriverImported:
+        Log("driver import: %s %s", e.ok ? "ok" : "failed", e.a.c_str());
+        ScanDrivers();
+        if (e.ok && FindUserDriver(kUserDriverPrefix + e.b)) s_.driver = kUserDriverPrefix + e.b, Save();
+        if (!e.a.empty()) ShowToast(e.a);
+        break;
+      case E::kSavesImported:
+        ScanSaves();
+        if (!e.a.empty()) ShowToast(e.a);
+        break;
+      case E::kSavesExported:
+      case E::kMessage:
+        if (!e.a.empty()) ShowToast(e.a);
+        break;
+      case E::kUpdate:
+        update_ = e.update;
+        Log("update check: state %d %s %s", int(update_.state), update_.tag.c_str(), update_.error.c_str());
+        if (update_.state == launcher::UpdateInfo::kLatest) platform::ClearUpdate();  // up to date: the downloaded APK goes
+        if (update_.state == launcher::UpdateInfo::kAvailable) ShowToast("A newer release is out: see Logs and updates");
+        break;
+      case E::kUpdateProgress: {  // Session 81
+        unsigned long long d = 0, t = 0;
+        if (std::sscanf(e.a.c_str(), "%llu %llu", &d, &t) == 2) up_done_ = d, up_total_ = t;
+        break;
+      }
+      case E::kUpdateDownloaded:
+        up_stage_ = e.ok ? 2 : 0;
+        up_error_ = e.ok ? std::string() : e.a;
+        Log("update: download %s %s", e.ok ? "finished and checked" : "FAILED:", e.a.c_str());
+        if (e.ok) ShowToast("The update is ready: see Logs and updates");
+        break;
+      case E::kBack: Back(); break;
+      case E::kSongsAdded:  // Lane 286 (custom music)
+      case E::kTextEntered: MusicEvent(e); break;
+      case E::kTronZipPicked:  // Session 98 (IMPORT TRON PREVIEWS)
+        if (e.ok) StartTronZipImport(e.a, e.b);
+        break;
+    }
+  }
+
+  void ShowToast(const std::string& text, uint64_t ms = 4000) {
+    toast_ = text;
+    toast_until_ = SDL_GetTicks() + ms;
+    Log("note: %s", text.c_str());
+  }
+  void Toast(ImVec2 size) {
+    if (toast_.empty() || SDL_GetTicks() > toast_until_) return;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const float wrap = std::min(size.x - D(48), D(520));
+    const ImVec2 ts = ImGui::CalcTextSize(toast_.c_str(), nullptr, false, wrap);
+    const ImVec2 p((size.x - ts.x) / 2, safe_max_.y - ts.y - D(110));
+    dl->AddRectFilled(ImVec2(p.x - D(16), p.y - D(12)), ImVec2(p.x + ts.x + D(16), p.y + ts.y + D(12)),
+                      IM_COL32(10, 10, 12, 235), D(6));
+    dl->AddRect(ImVec2(p.x - D(16), p.y - D(12)), ImVec2(p.x + ts.x + D(16), p.y + ts.y + D(12)), kMenuRed, D(6), 0, D(1.5f));
+    dl->AddText(nullptr, 0, p, IM_COL32_WHITE, toast_.c_str(), nullptr, wrap);
+  }
+
+ public:
+  ImFont* menu_font_ = nullptr;
+
+ private:
+  SDL_Window* window_;
+  SDL_Renderer* renderer_;
+  float ui_;
+  TestSteps test_;
+  fs::path files_;
+  std::string last_run_;               // Session 73: the last game run's end in plain words, empty when normal
+
+  // ---------------------------------------------------------------- Session 95 (LADDER): history, SAFE MODE, the cards
+  ladder::RungState rung_;
+  ladder::Advice advice_;
+  std::string settings_hash_;
+  double fps_advice_ = 0;  // the last run's mean fps when it ran under 52 at 60 FPS (0 = no card)
+  bool safe_dismissed_ = false, early_dismissed_ = false, memory_dismissed_ = false, fps_dismissed_ = false;
+  bool diag_arm_ended_ = false;
+  bool disk_card_ = false, disk_ok_once_ = false;
+  bool skip_precompile_after_card_ = false;  // the resume Play was stopped by the storage card: PLAY ANYWAY goes on without a second precompile
+  double disk_free_mb_ = 0;
+  int pending_play_wm30_ = -1;
+
+  fs::path HistoryPath() const { return files_ / "logs" / "run_history.txt"; }
+  fs::path RungPath() const { return files_ / "rung.txt"; }
+  fs::path BootTrialPath() const { return files_ / "logs" / "boot_trial.txt"; }
+
+  // The settings the game gets, without the SAFE MODE step: a change starts the history clean.
+  std::string SettingsHash() {
+    LaunchContext c = MakeContext(-1);
+    c.rung = 0;
+    std::string all;
+    for (const auto& a : GameArgs(s_, c)) all += a + "\n";
+    return ladder::Hash(all);
+  }
+
+  void LadderStart() {
+    std::error_code ec;
+    rung_ = ladder::ReadRung(RungPath(), kVersion, s_.driver);
+    const bool trial_left = fs::exists(BootTrialPath(), ec);
+    if (trial_left) {
+      fs::remove(BootTrialPath(), ec);
+      Log("ladder: the boot trial file was still there: the last game never reached 600 frames and was not quit by the player");
+    }
+    settings_hash_ = SettingsHash();
+    const ladder::RunEnd run = ladder::Classify(files_, check::AndroidSdkLevel());
+    static const char* const kKinds[] = {"none", "good", "bad", "memory", "unknown", "precompile"};
+    Log("ladder: last run %s %s (key %s, played %d, %.0f s after the first frame, trial %d), safe mode step %d", kKinds[run.kind],
+        run.name.c_str(), run.key.c_str(), int(run.played), run.play_seconds, int(trial_left), rung_.rung);
+    // The step that was in force during that run is the one in the rung file now (the launcher does not change it between).
+    // Not recorded: a diagnostic arm (other flags, 40 s long), and a run that ended before an app update (it belongs to the old version).
+    std::string seen_version;
+    {
+      std::ifstream sv(files_ / "last_seen_version.txt");
+      std::getline(sv, seen_version);
+    }
+    const bool before_update = !seen_version.empty() && seen_version != kVersion;
+    if (diag_arm_ended_ || trons_ended_ || before_update)
+      Log("ladder: last run not recorded (%s)", diag_arm_ended_ ? "diagnostic arm" : trons_ended_ ? "tron previews run" : "it ended before the app update");
+    else if (ladder::Record(HistoryPath(), run, kVersion, s_.driver, settings_hash_, rung_.rung)) Log("ladder: run recorded in run_history.txt");
+    std::ofstream(files_ / "last_seen_version.txt", std::ios::trunc) << kVersion << '\n';
+    advice_ = ladder::Decide(ladder::ReadHistory(HistoryPath()), kVersion, s_.driver, settings_hash_, rung_.rung);
+    // The advice from the last run's frame times (frames_NNN.csv, the newest log's number).
+    fps_advice_ = 0;
+    if (run.kind == ladder::RunEnd::kGood && s_.frame_rate == 1 && rung_.rung == 0) {
+      const std::string num = ladder::NewestLogNumber(files_ / "logs");
+      const double fps = ladder::MeanFps(files_ / "logs" / fs::u8path("frames_" + num + ".csv"));
+      if (fps > 0 && fps < 52) fps_advice_ = fps;
+    }
+    Log("ladder: bad in a row %d, safe next %d, memory card %d, early card '%s', fps advice %.1f", advice_.bad_in_row, advice_.safe_next,
+        int(advice_.memory_card), advice_.early_key.c_str(), fps_advice_);
+  }
+
+  void SetRung(int next) {
+    rung_.rung = next;
+    ladder::WriteRung(RungPath(), rung_, kVersion, s_.driver);
+    Log("ladder: SAFE MODE step %d (%s)", next, ladder::RungWords(next));
+    advice_ = ladder::Decide(ladder::ReadHistory(HistoryPath()), kVersion, s_.driver, settings_hash_, rung_.rung);
+  }
+  void SafeModeOff() {
+    rung_ = ladder::RungState();
+    std::error_code ec;
+    fs::remove(RungPath(), ec);
+    Log("ladder: SAFE MODE off");
+    advice_ = ladder::Decide(ladder::ReadHistory(HistoryPath()), kVersion, s_.driver, settings_hash_, 0);
+  }
+
+  void SafeModeHelpUi() {
+    GroupTitle("SAFE MODE");
+    if (rung_.rung > 0) {
+      ImGui::TextColored(kBad, "On: step %d - %s", rung_.rung, ladder::RungWords(rung_.rung));
+      if (Button("TURN SAFE MODE OFF")) SafeModeOff();
+      if (rung_.rung < ladder::kMaxRung - 1 && Button("NEXT STEP")) SetRung(rung_.rung + 1);
+    } else {
+      Note("If the game keeps crashing or freezing, this turns on safer graphics, one step at a time. The launcher offers it by itself "
+           "after two failed runs in a row.");
+      if (Button("TRY SAFE MODE (STEP 1)")) SetRung(1);
+    }
+  }
+
+  enum class Card { kNone, kDisk, kSafe, kEarly, kMemory, kFps, kStars };
+  Card CurrentCard() const {
+    if (stars_card_) return Card::kStars;  // Session 101
+    if (disk_card_) return Card::kDisk;
+    if (advice_.safe_next > 0 && !safe_dismissed_) return Card::kSafe;
+    if (!advice_.early_key.empty() && !early_dismissed_) return Card::kEarly;
+    if (advice_.memory_card && !memory_dismissed_) return Card::kMemory;
+    if (fps_advice_ > 0 && !fps_dismissed_) return Card::kFps;
+    return Card::kNone;
+  }
+
+  void DrawCard(ImVec2 size) {
+    const Card card = CurrentCard();
+    if (card == Card::kNone) return;
+    const float w = std::min(size.x - D(32), D(520));
+    ImGui::SetNextWindowPos(ImVec2(size.x / 2, size.y / 2), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(D(16), D(12)));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.06f, 0.07f, 0.98f));
+    ImGui::Begin("##card", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+    char text[512];
+    switch (card) {
+      case Card::kStars:  // Session 101 (lane 199)
+        GroupTitle("YOUR SUPERSTARS");
+        if (stars_job_) {
+          Note((stars_why_ + " Building them into the game from your own files...").c_str());
+          std::string ph;
+          {
+            std::lock_guard<std::mutex> lk(stars_job_->m);
+            ph = stars_job_->phase;
+          }
+          ImGui::ProgressBar(stars_job_->frac.load(), ImVec2(-1, 0), ph.empty() ? "Starting..." : ph.c_str());
+        } else {
+          Note(("Your superstars could not be built into the game: " + stars_fail_ + ". Open the SUPERSTAR IMPORTER (MODS) to fix it, "
+                "or play without them this time.").c_str());
+          if (Button("PLAY WITHOUT THEM")) {
+            stars_card_ = false, stars_fail_.clear();
+            stars_skip_once_ = stars_without_once_ = true;  // (review S1: the old pack must not load either)
+            Play(stars_wm30_);
+            stars_skip_once_ = stars_without_once_ = false;
+          }
+          if (Button("CANCEL")) stars_card_ = false, stars_fail_.clear();
+        }
+        break;
+      case Card::kDisk:
+        GroupTitle("LOW STORAGE");
+        std::snprintf(text, sizeof(text), "Only %.0f MB is free on this phone. The game needs room for its saves and shader cache; it may fail to save or to start.", disk_free_mb_);
+        Note(text);
+        if (Button("PLAY ANYWAY")) disk_card_ = false, disk_ok_once_ = true, Play(pending_play_wm30_);
+        if (Button("OK")) disk_card_ = false, skip_precompile_after_card_ = false;
+        break;
+      case Card::kSafe:
+        GroupTitle("SAFE MODE");
+        if (advice_.safe_next >= ladder::kMaxRung) {
+          Note("The game has failed again with every safe step on. There is no further step built in. Sharing the report lets the cause be found.");
+          if (Button("SHARE THE REPORT")) ShareLogs(), safe_dismissed_ = true;
+        } else {
+          std::snprintf(text, sizeof(text), "The last two game runs ended badly (a crash, a freeze or a black picture). Safe mode step %d: %s.",
+                        advice_.safe_next, ladder::RungWords(advice_.safe_next));
+          Note(text);
+          if (Button("TURN IT ON")) SetRung(advice_.safe_next);
+        }
+        if (Button("NOT NOW")) safe_dismissed_ = true;
+        break;
+      case Card::kEarly:
+        GroupTitle("YOUR LAST GAME");
+        Note("You left the game soon after it started. Did the picture look right?");
+        if (Button("YES, IT LOOKED RIGHT")) {
+          ladder::AnswerEarly(HistoryPath(), advice_.early_key, false);
+          early_dismissed_ = true;
+          Log("ladder: the player said the picture looked right");
+        }
+        if (Button("NO, IT LOOKED WRONG")) {
+          ladder::AnswerEarly(HistoryPath(), advice_.early_key, true);
+          early_dismissed_ = true;
+          Log("ladder: the player said the picture looked wrong (counts as a named bad end)");
+          advice_ = ladder::Decide(ladder::ReadHistory(HistoryPath()), kVersion, s_.driver, settings_hash_, rung_.rung);
+        }
+        break;
+      case Card::kMemory:
+        GroupTitle("LOW MEMORY");
+        Note("Android closed the game twice in a row for lack of memory while you were playing. Shadows off and the crowd at 30% use less. "
+             "A lower resolution uses less still, but it rebuilds the shader cache (up to 10 minutes).");
+        if (Button("SHADOWS OFF, CROWD 30%")) {
+          s_.shadows = false;
+          s_.crowd_density = std::min(s_.crowd_density, 30);
+          Save();
+          Log("ladder: memory card applied: shadows off, crowd 30");
+          memory_dismissed_ = true;
+          settings_hash_ = SettingsHash();
+          advice_ = ladder::Decide(ladder::ReadHistory(HistoryPath()), kVersion, s_.driver, settings_hash_, rung_.rung);
+        }
+        if (Button("NOT NOW")) memory_dismissed_ = true;
+        break;
+      case Card::kFps:
+        GroupTitle("PERFORMANCE");
+        std::snprintf(text, sizeof(text), "The last game ran at about %.0f fps. The 30 FPS setting runs smoother on a phone that cannot hold 60.", fps_advice_);
+        Note(text);
+        if (Button("USE 30 FPS")) {
+          s_.frame_rate = 3;
+          Save();
+          Log("ladder: fps card applied: 30 FPS");
+          fps_advice_ = 0;
+          settings_hash_ = SettingsHash();
+          advice_ = ladder::Decide(ladder::ReadHistory(HistoryPath()), kVersion, s_.driver, settings_hash_, rung_.rung);
+        }
+        if (Button("NOT NOW")) fps_dismissed_ = true;
+        break;
+      default: break;
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+  }
+  std::vector<check::Line> check_;     // Session 73: CHECK THIS PHONE's results
+  std::ofstream log_;
+  Settings s_;
+  // Session 95: the crowd before the QUALITY row's LOW moved it (-1 = LOW moved nothing). Leaving LOW gives it back if the slider
+  // still shows what LOW wrote, so clicking through LOW leaves no value behind.
+  int low_prev_crowd_ = -1;
+  void LeaveLow(int tier) {
+    if (s_.quality_tier == 1 && low_prev_crowd_ >= 0 && s_.crowd_density == kLowStartCrowd) {
+      s_.crowd_density = low_prev_crowd_;
+      Log("settings: LOW left: crowd back to %d%%", s_.crowd_density);
+    }
+    low_prev_crowd_ = -1;
+    s_.quality_tier = tier;
+    Save();
+  }
+  Page page_ = kHome;
+  bool landscape_ = false, scroll_reset_ = true;
+  ImVec2 safe_min_, safe_max_;
+  bool dragging_ = false, drag_cancelled_ = false, slider_active_ = false;
+  bool drawer_open_ = false;
+  float drawer_t_ = 0;  // 0 closed .. 1 open (the slide)
+  uint64_t last_back_ = 0;
+
+  std::string read_path_, address_, game_error_;
+  bool game_ok_ = false, game_from_usb_ = false;
+  launcher::GameFiles files_reader_;
+
+  launcher::GameFont gfont_;
+  Texture gfont_tex_;
+  bool font_tried_ = false;
+  std::vector<uint8_t> logo_px_;
+  int logo_w_ = 0, logo_h_ = 0;
+  bool logo_tried_ = false;
+  Texture logo_, bg_;
+  struct Band {
+    Texture tex;
+    int x = 0, y = 0;
+    std::array<float, 8> key{};
+    bool made = false;
+  };
+  Band bands_[kBandSlots];
+
+  bool save_exists_ = false;
+  uintmax_t save_bytes_ = 0;
+  int save_files_ = 0;
+  std::vector<bool> driver_bundled_;  // per kDrivers entry, looked up once (Start)
+  std::vector<UserDriver> user_drivers_;
+  std::vector<wwe2k14::dlc::Pack> packs_;
+  std::vector<std::string> pack_names_;
+  bool dlc_scanned_ = false;
+  wwe2k14::wm30list::Catalogue wm30_;
+  int wm30_pick_ = -1;
+  bool resume_play_ = false, precompile_skip_once_ = false;  // Session 93: the PLAY a finished precompile goes on with
+  int resume_wm30_ = -1, resume_frames_ = 0;
+  launcher::UpdateInfo update_;
+  int up_stage_ = 0;  // Session 81: 0 offer, 1 downloading, 2 downloaded and checked (INSTALL)
+  unsigned long long up_done_ = 0, up_total_ = 0;
+  std::string up_error_;
+  std::string toast_;
+  uint64_t toast_until_ = 0;
+};
+
+void ApplyStyle(float ui) {
+  ImGuiStyle& st = ImGui::GetStyle();
+  ImGui::StyleColorsDark();
+  st.WindowRounding = 0, st.FrameRounding = 3, st.GrabRounding = 3, st.ChildRounding = 0, st.PopupRounding = 3;
+  st.FramePadding = ImVec2(12, 10), st.ItemSpacing = ImVec2(10, 8), st.WindowPadding = ImVec2(16, 14);
+  st.ScrollbarSize = 4;
+  ImVec4* c = st.Colors;
+  c[ImGuiCol_WindowBg] = ImVec4(0.067f, 0.071f, 0.082f, 1);
+  c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
+  c[ImGuiCol_FrameBg] = ImVec4(0.13f, 0.135f, 0.16f, 0.95f);
+  c[ImGuiCol_FrameBgActive] = ImVec4(0.18f, 0.185f, 0.21f, 1);
+  c[ImGuiCol_SliderGrab] = ImVec4(0.84f, 0.09f, 0.12f, 1);
+  c[ImGuiCol_SliderGrabActive] = ImVec4(0.95f, 0.25f, 0.25f, 1);
+  c[ImGuiCol_Button] = ImVec4(0.20f, 0.205f, 0.24f, 1);
+  c[ImGuiCol_ButtonHovered] = ImVec4(0.20f, 0.205f, 0.24f, 1);  // touch: no hover colour
+  c[ImGuiCol_ButtonActive] = ImVec4(0.55f, 0.11f, 0.13f, 1);
+  c[ImGuiCol_CheckMark] = ImVec4(0.95f, 0.35f, 0.3f, 1);
+  c[ImGuiCol_NavCursor] = ImVec4(1, 1, 1, 0.8f);
+  st.ScaleAllSizes(ui);
+}
+
+// The text face: the phone's Roboto / Windows' Segoe UI; the menu fallback (no game files yet): a heavy face.
+void LoadFonts(ImGuiIO& io, float ui, App& app) {
+  static constexpr const char* kText[] = {"/system/fonts/Roboto-Regular.ttf", "/system/fonts/NotoSans-Regular.ttf",
+                                          "C:/Windows/Fonts/segoeui.ttf"};
+  static constexpr const char* kMenu[] = {"/system/fonts/Roboto-Black.ttf", "/system/fonts/Roboto-Bold.ttf",
+                                          "C:/Windows/Fonts/ariblk.ttf"};
+  std::error_code ec;
+  ImFont* text = nullptr;
+  for (const char* f : kText)
+    if (!text && fs::exists(f, ec)) text = io.Fonts->AddFontFromFileTTF(f, 18.0f * ui);
+  if (!text) io.Fonts->AddFontDefault();
+  for (const char* f : kMenu)
+    if (!app.menu_font_ && fs::exists(f, ec)) app.menu_font_ = io.Fonts->AddFontFromFileTTF(f, 18.0f * ui);
+  ImGui::GetStyle().FontSizeBase = 18.0f * ui;
+}
+
+TestSteps ParseTest(int argc, char** argv, int& win_w, int& win_h, float& scale) {
+  TestSteps t;
+  for (int i = 1; i + 1 < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--check") t.check = true;
+    else if (a == "--page") t.page = std::atoi(argv[++i]);
+    else if (a == "--shot") t.shot = argv[++i];
+    else if (a == "--frames") t.frames = std::max(1, std::atoi(argv[++i]));
+    else if (a == "--scroll") t.scroll = float(std::atof(argv[++i]));
+    else if (a == "--select") t.select = std::atoi(argv[++i]);
+    else if (a == "--drawer") t.drawer = std::atoi(argv[++i]) != 0;
+    else if (a == "--music-play") t.music_play = std::atoi(argv[++i]);
+    else if (a == "--music-busy") t.music_busy = true;
+    else if (a == "--window") std::sscanf(argv[++i], "%dx%d", &win_w, &win_h);
+    else if (a == "--scale") scale = float(std::atof(argv[++i]));
+    else if (a == "--tap") std::sscanf(argv[++i], "%f,%f", &t.tap_x, &t.tap_y);
+    else if (a == "--quit-ms") t.quit_ms = std::atoi(argv[++i]);
+    else if (a == "--import-trons") t.import_trons = argv[++i];  // Session 98
+  }
+  for (int i = 1; i < argc; ++i) {  // flags without a value (the loop above misses one given last)
+    const std::string a = argv[i];
+    if (a == "--share-test") t.share = true;
+    else if (a == "--diag-run") t.diag_run = true;
+    else if (a == "--check") t.check = true;
+  }
+  return t;
+}
+
+// Session 72: how the launcher draws, in its log (players share it from LOGS AND UPDATES): per ~10 s of drawing, the
+// frames, their rate while drawing (the screen's refresh rate when all is well) and a frame's own work before the
+// wait for the screen; a frame whose work takes over 50 ms gets a line of its own.
+struct DrawStats {
+  int frames = 0, slow_lines = 0;
+  double work_ms = 0, worst_ms = 0, total_ms = 0;
+  uint64_t start_ns = 0;
+  void Add(App& app, double work, double total) {
+    const uint64_t now = SDL_GetTicksNS();
+    if (!frames) start_ns = now;
+    ++frames, work_ms += work, total_ms += total, worst_ms = std::max(worst_ms, work);
+    if (work > 50 && slow_lines < 40) ++slow_lines, app.Log("slow frame: %.0f ms (%s)", work, app.PageName());
+    if (now - start_ns >= 10'000'000'000ull) Flush(app);
+  }
+  void Flush(App& app) {
+    if (!frames) return;
+    app.Log("drawing: %d frames in %.1f s, %.0f fps while drawing; a frame's work %.2f ms on average, %.1f ms at most",
+            frames, double(SDL_GetTicksNS() - start_ns) / 1e9, total_ms > 0 ? frames * 1000.0 / total_ms : 0.0,
+            work_ms / frames, worst_ms);
+    frames = 0, work_ms = worst_ms = total_ms = 0;
+  }
+};
+
+bool SaveShot(SDL_Renderer* r, const std::string& path) {
+  SDL_Surface* s = SDL_RenderReadPixels(r, nullptr);
+  if (!s) return false;
+  const bool ok = SDL_SavePNG(s, path.c_str());
+  SDL_DestroySurface(s);
+  return ok;
+}
+
+}  // namespace mlauncher
+
+int main(int argc, char** argv) {
+  using namespace mlauncher;
+  SDL_SetHint(SDL_HINT_ORIENTATIONS, "Portrait LandscapeLeft LandscapeRight");  // the launcher turns with the phone
+  SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");  // Back = our page back (LauncherActivity also sends it)
+  if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+    SDL_Log("wwe2k14 launcher: SDL_Init failed: %s", SDL_GetError());
+    return 1;
+  }
+  platform::Init(argc, argv);
+  int win_w = 720, win_h = 1584;  // PC test: half the Find X8 Ultra's 1440 x 3168
+  float scale = 0;
+  TestSteps test = ParseTest(argc, argv, win_w, win_h, scale);
+#ifdef __ANDROID__
+  // Not full screen: the phone's own bars stay (in immersive full screen the first Back swipe only shows them, a
+  // likely cause of Jarrod's two-Back report, unconfirmed); the layout keeps to the safe area.
+  const SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#else
+  const SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | (test.shot.empty() && !test.share ? 0 : SDL_WINDOW_HIDDEN);
+#endif
+  SDL_Window* window = SDL_CreateWindow("WWE 2K14", win_w, win_h, flags);
+  SDL_Renderer* renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
+  if (!renderer) {
+    SDL_Log("wwe2k14 launcher: no window / renderer: %s", SDL_GetError());
+    return 1;
+  }
+  SDL_SetRenderVSync(renderer, 1);
+
+  // The UI scale in ImGui's units: the screen's density (a 560 dpi phone: 3.5) over what SDL already scales.
+  int pw = 0, ph = 0, ww = 0, wh = 0;
+  SDL_GetWindowSizeInPixels(window, &pw, &ph);
+  SDL_GetWindowSize(window, &ww, &wh);
+  float ui = scale > 0 ? scale : SDL_GetWindowDisplayScale(window) / (ww > 0 ? float(pw) / float(ww) : 1.f);
+  if (!(ui > 0.5f && ui < 8)) ui = 1;
+
+  IMGUI_CHECKVERSION();
+  ImGui::CreateContext();
+  ImGuiIO& io = ImGui::GetIO();
+  io.IniFilename = nullptr;
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard;
+  ApplyStyle(ui);
+  App app(window, renderer, ui);
+  LoadFonts(io, ui, app);
+  ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+  ImGui_ImplSDLRenderer3_Init(renderer);
+  app.Start(test);
+  app.Log("renderer: %s, %d x %d pixels", SDL_GetRendererName(renderer), pw, ph);
+
+  bool running = !test.share;  // --share-test: Start made the zip; nothing to draw
+  int frame = 0;
+  // Session 72 (players: "the launcher runs at about 15 fps"): it drew one frame per batch of input, else one every
+  // 100 ms, while ImGui spreads a tap over three frames (finger position, down, up: imgui.cpp's input trickling), so
+  // a tap's page came 200-300 ms late and the sidebar slid at ~10 fps; and it drew 10 frames a second doing nothing.
+  // Now: after input it draws at the screen's rate until ImGui has used it all and the page has settled
+  // (kSettleFrames), then sleeps until the next event (SDL wakes on touch, keys, the activity's events; a note at the
+  // bottom wakes it when it goes).
+  constexpr int kSettleFrames = 6;
+  int settle = kSettleFrames;
+  DrawStats stats;
+  int drawn = 0;
+  while (running) {
+    SDL_Event e;
+    if (test.tap_x >= 0 && drawn == 3) {  // the PC test's tap, as a phone's touch arrives (SDL_TOUCH_MOUSEID)
+      SDL_Event m{};
+      m.type = SDL_EVENT_MOUSE_MOTION, m.motion.windowID = SDL_GetWindowID(window), m.motion.which = SDL_TOUCH_MOUSEID;
+      m.motion.x = test.tap_x, m.motion.y = test.tap_y;
+      SDL_PushEvent(&m);
+      SDL_Event b{};
+      b.type = SDL_EVENT_MOUSE_BUTTON_DOWN, b.button.windowID = m.motion.windowID, b.button.which = SDL_TOUCH_MOUSEID;
+      b.button.button = SDL_BUTTON_LEFT, b.button.down = true, b.button.clicks = 1, b.button.x = test.tap_x, b.button.y = test.tap_y;
+      SDL_PushEvent(&b);
+      b.type = SDL_EVENT_MOUSE_BUTTON_UP, b.button.down = false;
+      SDL_PushEvent(&b);
+      app.Log("test: tap at %.0f, %.0f", test.tap_x, test.tap_y);
+    }
+    if (test.quit_ms && SDL_GetTicks() >= uint64_t(test.quit_ms)) break;
+    if (app.Busy()) settle = std::max(settle, 2);
+    int wait = app.IdleWaitMs();
+    if (test.quit_ms) wait = int(std::clamp<int64_t>(int64_t(test.quit_ms) - int64_t(SDL_GetTicks()), 1, wait < 0 ? INT32_MAX : wait));
+    const bool got = (!test.shot.empty() || settle > 0) ? SDL_PollEvent(&e) : SDL_WaitEventTimeout(&e, wait);
+    if (!got && settle > 0) --settle;
+    if (got) {
+      settle = kSettleFrames;
+      do {
+        ImGui_ImplSDL3_ProcessEvent(&e);
+        if (e.type == SDL_EVENT_QUIT) running = false;
+        else if (e.type == SDL_EVENT_KEY_DOWN && (e.key.key == SDLK_AC_BACK || e.key.key == SDLK_ESCAPE)) app.Back();
+        else if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND) app.OnBackground();  // lane 297: a preview does not play on in the background
+        else if (e.type == SDL_EVENT_RENDER_DEVICE_RESET) {
+          ImGui_ImplSDLRenderer3_DestroyDeviceObjects();
+          app.DeviceReset();
+        }
+      } while (SDL_PollEvent(&e));
+    }
+    const uint64_t t0 = SDL_GetTicksNS();
+    ImGui_ImplSDLRenderer3_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    app.Frame();
+    ImGui::Render();
+    SDL_SetRenderDrawColor(renderer, 17, 18, 21, 255);
+    SDL_RenderClear(renderer);
+    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
+    if (!test.shot.empty() && ++frame >= test.frames && !app.TestHold()) {
+      const bool ok = SaveShot(renderer, test.shot);
+      app.Log("shot %s: %s", test.shot.c_str(), ok ? "saved" : SDL_GetError());
+      running = false;
+    }
+    const uint64_t t1 = SDL_GetTicksNS();
+    SDL_RenderPresent(renderer);
+    stats.Add(app, double(t1 - t0) / 1e6, double(SDL_GetTicksNS() - t0) / 1e6);
+    ++drawn;
+  }
+  stats.Flush(app);
+  ImGui_ImplSDLRenderer3_Shutdown();
+  ImGui_ImplSDL3_Shutdown();
+  ImGui::DestroyContext();
+  SDL_DestroyRenderer(renderer);
+  SDL_DestroyWindow(window);
+  SDL_Quit();
+  return 0;
+}

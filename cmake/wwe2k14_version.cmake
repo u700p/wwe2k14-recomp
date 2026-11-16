@@ -6,8 +6,8 @@ get_filename_component(_wwe2k14_version_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSO
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_wwe2k14_version_root}/VERSION")
 file(STRINGS "${_wwe2k14_version_root}/VERSION" WWE2K14_VERSION LIMIT_COUNT 1)
 string(STRIP "${WWE2K14_VERSION}" WWE2K14_VERSION)
-if(NOT WWE2K14_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$")
-  message(FATAL_ERROR "VERSION must look like 1.1.0 or 1.1.0-rc1, got '${WWE2K14_VERSION}'")
+if(NOT WWE2K14_VERSION MATCHES "^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$")
+  message(FATAL_ERROR "VERSION must look like 1.1.0, v0.3.3 or 1.1.0-rc1, got '${WWE2K14_VERSION}'")
 endif()
 
 set(WWE2K14_VERSION_COMMIT unknown)
